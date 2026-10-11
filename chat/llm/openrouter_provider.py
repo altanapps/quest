@@ -10,7 +10,12 @@ Inference Providers.
 The same class serves **Fireworks AI** instances (kind ``fireworks``: the
 kind's fixed ``upstream_url`` ``https://api.fireworks.ai/inference/v1``
 with the instance's bearer API key, no OpenRouter-only extensions --
-Fireworks already includes usage in the final streamed chunk) and
+Fireworks already includes usage in the final streamed chunk), **NEAR AI
+Cloud** instances (kind ``nearai``: ``https://cloud-api.near.ai/v1`` with
+the instance's bearer key, plus the ``x-no-aliasing: true`` default header
+so NEAR never substitutes another model for the one asked for; its health
+check consults the public catalog instead of billing a completion -- see
+:meth:`OpenRouterProvider.check_model_access`) and
 **self-hosted** instances (kind ``local`` with API type ``openai``): the
 instance's own base URL replaces OpenRouter's, the key is optional (sent
 as a bearer token only when stored) and the OpenRouter-only request
@@ -112,6 +117,11 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # to send and they identify this deployment's traffic in the OpenRouter
 # dashboard.
 _OPENROUTER_HEADERS = {"X-Title": "Quest"}
+# NEAR AI Cloud: never let the gateway substitute another model for the one
+# requested (the model's identity is the point of a confidential-inference
+# provider). A client default header, so it rides on every request.
+NEARAI_KIND = "nearai"
+_NEARAI_HEADERS = {"x-no-aliasing": "true"}
 
 
 @dataclass
@@ -195,12 +205,24 @@ class OpenRouterProvider(LLMProvider):
                 "Providers (admin only)."
             )
         is_openrouter = kind_name == LEGACY_OPENROUTER_INSTANCE_ID
+        headers = None
+        if is_openrouter:
+            headers = _OPENROUTER_HEADERS
+        elif kind_name == NEARAI_KIND:
+            headers = _NEARAI_HEADERS
         return {
             "base_url": kind["upstream_url"] or OPENROUTER_BASE_URL,
             "api_key": api_key,
-            "headers": _OPENROUTER_HEADERS if is_openrouter else None,
+            "headers": headers,
             "openrouter": is_openrouter,
         }
+
+    def _instance_kind(self) -> str | None:
+        """The configured kind of this instance (None when it has no entry)."""
+        from config.inference_providers import get_instance
+
+        instance = get_instance(self.instance_id)
+        return instance["kind"] if instance is not None else None
 
     def _get_client(self):
         """Return a cached AsyncOpenAI client for this instance's endpoint.
@@ -240,13 +262,40 @@ class OpenRouterProvider(LLMProvider):
         Used by the admin inference-provider health check: catches a revoked
         or unfunded key, a model id OpenRouter no longer serves, and quota
         exhaustion. max_tokens=1 keeps the cost negligible.
+
+        NEAR AI Cloud instances are checked against the public catalog
+        instead (:meth:`_check_nearai_catalog`): NEAR lists ~40 chat models
+        and documents no rate limits, and the startup sweep checks every
+        configured model on each boot, so a billed completion per model per
+        restart is not worth it. Key problems surface on the first real turn
+        with the provider's own auth error.
         """
+        if self._instance_kind() == NEARAI_KIND:
+            await self._check_nearai_catalog(model)
+            return
         client = self._get_client()
         await client.chat.completions.create(
             model=self._get_openrouter_model_id(model),
             max_tokens=1,
             messages=[{"role": "user", "content": "ok"}],
         )
+
+    async def _check_nearai_catalog(self, model: str) -> None:
+        """Health check without a paid call: the model must be in NEAR's
+        catalog and tool-capable. The endpoint is still resolved so a
+        missing key is reported like every other kind."""
+        from chat.llm.nearai_catalog import get_catalog, is_chat_model
+
+        self._endpoint()
+        wire_id = self._get_openrouter_model_id(model)
+        catalog = await asyncio.to_thread(get_catalog)
+        entry = next((m for m in catalog["models"] if m["id"] == wire_id), None)
+        if entry is None:
+            if catalog["error"] and not catalog["models"]:
+                raise ValueError(f"NEAR AI catalog unavailable: {catalog['error']}")
+            raise ValueError(f"Model {wire_id!r} is not in NEAR AI Cloud's catalog.")
+        if not is_chat_model(entry):
+            raise ValueError(f"Model {wire_id!r} does not support tool calling on NEAR AI Cloud.")
 
     def create_session(
         self,

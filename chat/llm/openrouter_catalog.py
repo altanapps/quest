@@ -204,13 +204,21 @@ def search_catalog(models: list[dict], query: str, limit: int = 20) -> list[dict
 
 
 def catalog_snapshot(models: list[dict], wire_id: str) -> dict | None:
-    """The metadata snapshot for one wire id, or None when not listed."""
+    """The metadata snapshot for one wire id, or None when not listed.
+
+    Shared by every catalog that produces the OpenRouter row shape
+    (Fireworks, NEAR AI, self-hosted discovery). A NEAR entry's ``tee``
+    label (enclave / proxy) rides along when present.
+    """
     for model in models:
         if model["id"] == wire_id:
-            return {
+            snapshot = {
                 "name": model["name"],
                 "context_length": model["context_length"],
                 "max_completion_tokens": model["max_completion_tokens"],
                 "pricing": model["pricing"],
             }
+            if model.get("tee"):
+                snapshot["tee"] = model["tee"]
+            return snapshot
     return None

@@ -1655,9 +1655,15 @@ export interface InferenceModelInfo {
   // Provider-announced shutdown date ("YYYY-MM-DD", Vertex models only);
   // the server stops listing the model on that date
   discontinued_on: string | null;
+  // NEAR AI Cloud models only: where the model runs per NEAR's catalog --
+  // in NEAR's own hardware-attested enclave fleet or relayed to a third
+  // party. Informational badge, enforced nowhere. null elsewhere.
+  tee: TeeLabel | null;
   // null when the model has never been health-checked
   status: InferenceModelStatus | null;
 }
+
+export type TeeLabel = 'enclave' | 'proxy';
 
 // Result of a live per-model health recheck (also the newly stored status)
 export interface InferenceModelTestResult extends InferenceModelStatus {
@@ -1708,9 +1714,9 @@ export interface InferenceApiType {
 }
 
 // Where a kind's "Add model" typeahead looks: the shared OpenRouter
-// catalog, the instance's own key-fetched Fireworks catalog, or the
-// self-hosted server's live model list
-export type InferenceCatalogSource = 'openrouter' | 'fireworks' | 'server';
+// catalog, the instance's own key-fetched Fireworks catalog, NEAR AI
+// Cloud's public catalog, or the self-hosted server's live model list
+export type InferenceCatalogSource = 'openrouter' | 'fireworks' | 'nearai' | 'server';
 
 export interface InferenceInstanceKind {
   kind: string;
@@ -1758,10 +1764,12 @@ export interface OpenRouterCatalogModel {
   context_length: number | null;
   max_completion_tokens: number | null;
   pricing: { prompt: number; completion: number; cache_read?: number } | null;
-  // Self-hosted discovery / Fireworks only: a short summary (family, size,
-  // quantization / "tools · vision · 128K ctx") and capabilities
+  // Self-hosted discovery / Fireworks / NEAR AI only: a short summary
+  // (family, size, quantization / "tools · vision · 128K ctx") and capabilities
   detail?: string;
   capabilities?: string[] | null;
+  // NEAR AI only: enclave / proxy (see InferenceModelInfo.tee)
+  tee?: TeeLabel;
 }
 
 // An instance's own catalog: the models a self-hosted server reports right

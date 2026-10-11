@@ -17,6 +17,7 @@ import type {
   InferenceModelInfo,
   InferenceProvidersListResponse,
   OpenRouterCatalogModel,
+  TeeLabel,
   VertexProviderStatus,
   VertexSectionInfo,
 } from '../../api/types';
@@ -310,6 +311,7 @@ function ModelRow({
         </span>
         {/* Always rendered (possibly empty) so the grid columns stay put */}
         <span className="inf-prov-model-display" title={showName ? model.display_name : undefined}>
+          {model.tee && <TeeBadge tee={model.tee} />}
           {showName ? model.display_name : ''}
         </span>
         <span className="inf-prov-model-controls">
@@ -362,6 +364,20 @@ function ModelRow({
         />
       )}
     </div>
+  );
+}
+
+const TEE_TITLES: Record<TeeLabel, string> = {
+  enclave: 'Runs inside NEAR AI Cloud’s own hardware-attested enclave fleet (Intel TDX + NVIDIA TEE GPUs)',
+  proxy: 'Relayed by NEAR AI Cloud to a third-party provider; not served from NEAR’s own enclaves',
+};
+
+/** NEAR AI Cloud model rows: where the model runs, per NEAR's catalog. */
+function TeeBadge({ tee }: { tee: TeeLabel }) {
+  return (
+    <span className={`inf-prov-tee-badge ${tee}`} title={TEE_TITLES[tee]}>
+      {tee === 'enclave' ? 'Enclave' : 'Proxy'}
+    </span>
   );
 }
 
@@ -754,6 +770,12 @@ function addModelCopy(
           : 'Save the API key first',
         emptyHint: 'Type to search the catalog',
       };
+    case 'nearai':
+      // NEAR's catalog is public, so the typeahead works before a key is saved
+      return {
+        placeholder: 'Add a model — search the NEAR AI catalog or type a model id',
+        emptyHint: 'Type to search the catalog',
+      };
     default:
       return {
         placeholder: 'Add a model — search the OpenRouter catalog or type an id',
@@ -940,9 +962,11 @@ function InstanceCard({
 
   const existing = new Set(status.models.map((m) => m.wire_id));
   const dirty = !!apiKey.trim() || labelDirty || baseUrlDirty || apiTypeDirty;
-  // The shared OpenRouter catalog needs no credentials; an instance's own
-  // catalog (self-hosted server, Fireworks) needs the instance configured.
+  // The shared OpenRouter catalog and NEAR AI's public catalog need no
+  // credentials; a self-hosted server's or Fireworks' own catalog needs the
+  // instance configured first.
   const ownCatalog = catalog !== 'openrouter';
+  const catalogNeedsConfig = ownCatalog && catalog !== 'nearai';
   const addModel = addModelCopy(catalog, status.configured);
   const modelsNote = endpoint
     ? 'Self-hosted models are priced at $0. Rename a model or set its context window below each row' +
@@ -953,7 +977,11 @@ function InstanceCard({
       ? 'Fireworks model ids are resource names such as accounts/fireworks/models/<name>; ' +
         'the catalog lists the serverless models. A dedicated deployment ' +
         '(accounts/<account>/deployments/<id>) can be typed in as a custom id.'
-      : undefined;
+      : catalog === 'nearai'
+        ? 'NEAR AI Cloud serves open-weight models in hardware-attested enclaves. Models marked ' +
+          'Enclave run on NEAR’s own TEE fleet; Proxy models are relayed to a third-party provider. ' +
+          'The catalog lists tool-capable models; any other model id can be typed in as a custom id.'
+        : undefined;
 
   return (
     <CredentialCard
@@ -1042,7 +1070,7 @@ function InstanceCard({
         >
           <AddModelCombobox
             existing={existing}
-            disabled={modelsBusy || deleting || (ownCatalog && !status.configured)}
+            disabled={modelsBusy || deleting || (catalogNeedsConfig && !status.configured)}
             search={ownCatalog ? instanceSearch : openRouterSearch}
             placeholder={addModel.placeholder}
             emptyHint={addModel.emptyHint}

@@ -20,7 +20,9 @@ Providers:
   pick models from the OpenRouter catalog (or a typed custom id);
   ``fireworks`` instances hold a Fireworks AI API key and pick models from
   Fireworks' serverless catalog (``chat/llm/fireworks_catalog.py``, fetched
-  with that key); ``local`` instances point at a self-hosted inference
+  with that key); ``nearai`` instances hold a NEAR AI Cloud API key and
+  pick models from NEAR's public catalog (``chat/llm/nearai_catalog.py``,
+  which also labels each model enclave-or-proxy); ``local`` instances point at a self-hosted inference
   server (``base_url`` + ``api_type``, optional key) and pick models from
   what that server reports (``chat/llm/local_catalog.py``). Several
   instances of the same kind can coexist (e.g. a personal and a team
@@ -98,8 +100,9 @@ logger = logging.getLogger(__name__)
 # typeahead gets its candidates: ``openrouter`` = the shared public
 # OpenRouter list (chat/llm/openrouter_catalog.py, no key needed),
 # ``fireworks`` = Fireworks' serverless catalog fetched with the instance's
-# own key (chat/llm/fireworks_catalog.py), ``server`` = live discovery
-# against the instance's server (chat/llm/local_catalog.py).
+# own key (chat/llm/fireworks_catalog.py), ``nearai`` = NEAR AI Cloud's
+# public catalog (chat/llm/nearai_catalog.py, no key needed), ``server`` =
+# live discovery against the instance's server (chat/llm/local_catalog.py).
 #
 # Every kind runs on the ``openrouter`` LLMProvider family -- the OpenAI
 # chat-completions message format, history shape and analytics table
@@ -137,6 +140,23 @@ INSTANCE_KINDS: dict[str, dict] = {
         "endpoint": False,
         "upstream_url": "https://api.fireworks.ai/inference/v1",
         "catalog": "fireworks",
+    },
+    # NEAR AI Cloud (https://cloud.near.ai): open-weight models served
+    # inside hardware-attested enclaves behind an OpenAI-compatible API at
+    # cloud-api.near.ai/v1, authenticated by an API key created in the
+    # NEAR AI Cloud dashboard (``sk-...``) and sent as a bearer token.
+    # Wire ids are HuggingFace-style ``<org>/<model>`` names. Its catalog
+    # (chat/llm/nearai_catalog.py) is public and classifies each model as
+    # running in NEAR's own enclave fleet or relayed to a third party.
+    "nearai": {
+        "label": "NEAR AI Cloud",
+        "hint": "sk-...",
+        "provider": "openrouter",
+        "backend": "nearai",
+        "key_required": True,
+        "endpoint": False,
+        "upstream_url": "https://cloud-api.near.ai/v1",
+        "catalog": "nearai",
     },
     "local": {
         "label": "Self-hosted",
@@ -449,11 +469,18 @@ def _normalize_pricing(value) -> dict | None:
     return out
 
 
+# Where a NEAR AI Cloud model runs, as snapshotted from its catalog: in
+# NEAR's own hardware-attested enclave fleet or relayed to a third party.
+# Informational (a badge in Settings); only NEAR snapshots carry it.
+TEE_LABELS = ("enclave", "proxy")
+
+
 def normalize_instance_model(entry) -> dict | None:
     """Normalize one instance model entry; None when it has no usable id.
 
     Accepts a bare wire-id string (enabled, no metadata) or the full dict
-    shape written by the admin endpoints. Unknown keys are dropped.
+    shape written by the admin endpoints. Unknown keys are dropped; the
+    optional ``tee`` label is kept only when it is one of :data:`TEE_LABELS`.
     """
     if isinstance(entry, str):
         entry = {"id": entry}
@@ -464,7 +491,7 @@ def normalize_instance_model(entry) -> dict | None:
         return None
     wire_id = wire_id.strip()
     name = entry.get("name")
-    return {
+    normalized = {
         "id": wire_id,
         "enabled": entry.get("enabled", True) is not False,
         "name": name.strip() if isinstance(name, str) and name.strip() else wire_id,
@@ -472,6 +499,9 @@ def normalize_instance_model(entry) -> dict | None:
         "max_completion_tokens": _as_positive_int(entry.get("max_completion_tokens"), None),
         "pricing": _normalize_pricing(entry.get("pricing")),
     }
+    if entry.get("tee") in TEE_LABELS:
+        normalized["tee"] = entry["tee"]
+    return normalized
 
 
 def _normalize_instance(entry) -> dict | None:

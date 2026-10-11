@@ -1187,6 +1187,8 @@ def _model_view(spec, statuses: dict) -> dict:
         "enabled": spec.enabled,
         "max_input_tokens": spec.max_input_tokens,
         "discontinued_on": spec.discontinued_on,
+        # NEAR AI Cloud only: "enclave" / "proxy" from the catalog snapshot
+        "tee": spec.tee,
         "status": statuses.get(spec.id),
     }
 
@@ -1593,6 +1595,10 @@ async def _catalog_snapshots(instance: dict, wire_ids: list[str]) -> dict[str, d
         catalog = await asyncio.to_thread(
             get_fireworks_catalog, effective_api_key(instance["id"])[0]
         )
+    elif source == "nearai":
+        from chat.llm.nearai_catalog import get_catalog as get_nearai_catalog
+
+        catalog = await asyncio.to_thread(get_nearai_catalog)
     else:
         from chat.llm.openrouter_catalog import get_catalog
 
@@ -1609,6 +1615,7 @@ async def admin_instance_catalog(
     q: str = "",
     limit: int = 20,
     refresh: bool = False,
+    all: bool = False,
     user: dict = Depends(get_current_user_cookie_or_apikey_checked),
 ):
     """Typeahead candidates from an instance's OWN model catalog, filtered
@@ -1623,6 +1630,9 @@ async def admin_instance_catalog(
       instance's stored key (cached 24h, ``refresh=true`` re-fetches);
       a missing or rejected key sets ``error`` with the stale cache -- or
       an empty list -- so custom-id entry still works.
+    - NEAR AI Cloud instances: the public catalog (no key needed, cached
+      24h, ``refresh=true`` re-fetches), tool-capable chat models only
+      unless ``all=true``; each row carries its ``tee`` label.
 
     400 for kinds whose typeahead is the shared OpenRouter catalog
     (``GET /admin/inference-providers/openrouter/catalog``).
@@ -1636,6 +1646,16 @@ async def admin_instance_catalog(
     instance = _instance_or_404(instance_id)
     source = INSTANCE_KINDS[instance["kind"]]["catalog"]
     limit = max(1, min(limit, 100))
+    if source == "nearai":
+        from chat.llm.nearai_catalog import chat_models
+        from chat.llm.nearai_catalog import get_catalog as get_nearai_catalog
+
+        catalog = await asyncio.to_thread(get_nearai_catalog, refresh)
+        models = catalog["models"] if all else chat_models(catalog["models"])
+        return {
+            "models": search_catalog(models, q, limit),
+            "error": catalog["error"],
+        }
     if source == "fireworks":
         from chat.llm.fireworks_catalog import get_catalog as get_fireworks_catalog
 
