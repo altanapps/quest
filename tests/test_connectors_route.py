@@ -452,3 +452,34 @@ def test_telegram_plugin_row(telegram_plugin):
     }
     assert _rows(pending)["telegram"]["connected"] is False
     assert _rows({"email": "u@example.com"})["telegram"]["connected"] is False
+
+
+def test_form_kind_plugin_row_not_rendered_as_oauth():
+    """A form-kind connection has no oauth connect_url: it is rendered as
+    a multi-connection form row (see tests/test_connectors_multi.py), never
+    mis-rendered as an oauth row."""
+    from config.plugin_types import (
+        CredentialField, QuestPlugin, UserConnectionSpec, VerifyResult,
+    )
+
+    async def _verify(values):
+        return VerifyResult(account="a@example.com")
+
+    plugin = QuestPlugin(
+        id="formy",
+        label="Formy",
+        user_connection=UserConnectionSpec(
+            kind="form",
+            connected=lambda row: True,
+            fields=(CredentialField(key="host", label="Host", type="text"),),
+            verify=_verify,
+        ),
+    )
+    rows = _get_connectors_with_plugin(
+        {"email": "u@example.com"}, plugin, None,
+    )
+    row = rows["formy"]
+    assert row["kind"] == "form"
+    assert row["multi_connection"] is True
+    assert row["connections_url"] == "/auth/connections/formy"
+    assert "connect_url" not in row and "key_url" not in row

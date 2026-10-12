@@ -46,16 +46,49 @@ class ServiceSpec:
     unflatten: Optional[Callable[[dict, dict], dict]] = None
 
 
-def _validate_fields(service: str, fields: tuple[CredentialField, ...]) -> None:
-    """Reject schemas the generic form machinery cannot render safely."""
+FIELD_TYPES = ("text", "secret", "bool", "textarea", "select")
+
+
+def _validate_fields(
+    service: str,
+    fields: tuple[CredentialField, ...],
+    *,
+    allow_select: bool = False,
+    runtime_option_keys: frozenset = frozenset(),
+) -> None:
+    """Reject schemas the generic form machinery cannot render safely.
+
+    ``select`` is accepted only with ``allow_select`` (per-user ``form``
+    connection fields; the admin card cannot render it yet). Select fields
+    need static ``options`` unless their key is in ``runtime_option_keys``
+    (a ``form`` connection whose ``field_options()`` hook supplies the
+    choices at request time).
+    """
     keys = [f.key for f in fields]
     if len(keys) != len(set(keys)):
         raise ValueError(f"Service {service!r} declares duplicate field keys")
     bool_keys = {f.key for f in fields if f.type == "bool"}
     for f in fields:
-        if f.type not in ("text", "secret", "bool", "textarea"):
+        if f.type not in FIELD_TYPES or (f.type == "select" and not allow_select):
             raise ValueError(
                 f"Service {service!r} field {f.key!r} has unknown type {f.type!r}"
+            )
+        if not isinstance(f.options, tuple) or not all(
+            isinstance(o, str) and o for o in f.options
+        ):
+            raise ValueError(
+                f"Service {service!r} field {f.key!r} options must be a tuple "
+                "of non-empty strings"
+            )
+        if f.type == "select":
+            if not f.options and f.key not in runtime_option_keys:
+                raise ValueError(
+                    f"Service {service!r} select field {f.key!r} needs options"
+                )
+        elif f.options:
+            raise ValueError(
+                f"Service {service!r} field {f.key!r} sets options but is "
+                "not a select field"
             )
         for ref_attr in ("required_if", "visible_if"):
             ref = getattr(f, ref_attr)
@@ -291,6 +324,7 @@ def fields_view(spec: ServiceSpec) -> list[dict]:
             "required": f.required,
             "required_if": f.required_if,
             "visible_if": f.visible_if,
+            **({"options": list(f.options)} if f.type == "select" else {}),
         }
         for f in spec.fields
     ]
@@ -352,6 +386,8 @@ def resolve_update(spec: ServiceSpec, values: dict, existing: dict | None) -> di
             # read view without ever sending the secret back out).
             stored = flat_existing.get(f.key)
             value = stored if isinstance(stored, str) else ""
+        if f.type == "select" and value and value not in f.options:
+            raise ValueError(f"{f.label} must be one of: {', '.join(f.options)}.")
         resolved[f.key] = value
 
     for f in spec.fields:

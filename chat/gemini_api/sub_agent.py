@@ -189,6 +189,7 @@ async def _run_sub_agent(
     if custom_prompt is None:
         custom_prompt = user.get("settings", {}).get("custom_system_prompt", "")
     from api.instructions import get_user_connected_services
+    from config.user_connections import build_connected_accounts_paragraph
     connected_services = get_user_connected_services(user)
     # The sub-agent shares the parent's conversation: its prompt carries the
     # parent's workspace notice flags (resolved once by run_conversation_turn
@@ -207,6 +208,12 @@ async def _run_sub_agent(
         can_nest=can_nest,
         legacy_shared_workspace=bool(notice_flags.get("legacy_shared_workspace")),
         converted_from_standalone=bool(notice_flags.get("converted_from_standalone")),
+        # No public-project guard needed (spec 11.5): _run_sub_agent is not
+        # told whether the parent is public because a public conversation
+        # can never reach it -- the agent_task* spawners are absent from the
+        # PUBLIC_TOOLS tier and hard-rejected in public runs via
+        # _PUBLIC_BLOCKED_LOOP_TOOLS (turn_tools.py).
+        connected_accounts=build_connected_accounts_paragraph(user),
     )
 
     # Choose the tool tier: only a 1st-level sub-agent with the flag on gets the

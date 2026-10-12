@@ -502,6 +502,19 @@ async def get_connectors(user: dict = Depends(get_current_user_cookie_or_apikey_
         spec = plugin.user_connection
         if spec is None:
             continue
+        if spec.kind == "form":
+            # form-kind connections are always multi-connection (the loader
+            # enforces it): their row is the per-connection shape only.
+            from auth.connections import multi_connection_fields
+            plugin_row = {
+                "service": plugin.id,
+                "label": plugin.label,
+                "kind": spec.kind,
+                "available": plugin_server_available(plugin),
+            }
+            plugin_row.update(multi_connection_fields(plugin, user))
+            connectors.append(plugin_row)
+            continue
         row = stored_rows.get(plugin.id)
         try:
             connected = bool(row) and bool(spec.connected(row))
@@ -514,17 +527,23 @@ async def get_connectors(user: dict = Depends(get_current_user_cookie_or_apikey_
             "connected": connected,
             "available": plugin_server_available(plugin),
         }
+        multi = bool(getattr(spec, "multi_connection", False))
         if spec.kind == "api_key":
-            secret = (row or {}).get("secret")
-            plugin_row.update({
-                "key_hint": secret[-4:] if (spec.key_hint and secret) else None,
-                "key_url": f"/auth/service-key/{plugin.id}",
-                "key_field": "api_key",
-                "key_placeholder": (
-                    spec.key_placeholder or f"Paste {plugin.label} API key"
-                ),
-                "disconnect_url": f"/auth/service-key/{plugin.id}/remove",
-            })
+            if not multi:
+                # Single-connection key routes only. A multi-connection
+                # service adds keys per connection via connections_url and
+                # has no service-wide Disconnect (spec 11.6); the generic
+                # /auth/service-key routes 404 for it.
+                secret = (row or {}).get("secret")
+                plugin_row.update({
+                    "key_hint": secret[-4:] if (spec.key_hint and secret) else None,
+                    "key_url": f"/auth/service-key/{plugin.id}",
+                    "key_field": "api_key",
+                    "key_placeholder": (
+                        spec.key_placeholder or f"Paste {plugin.label} API key"
+                    ),
+                    "disconnect_url": f"/auth/service-key/{plugin.id}/remove",
+                })
             # Optional guidance for the key-entry step: where to create
             # the credential. Omitted entirely when the spec sets neither.
             if spec.key_help:
@@ -545,6 +564,12 @@ async def get_connectors(user: dict = Depends(get_current_user_cookie_or_apikey_
                 "connect_url": f"{plugin_auth_prefix(plugin.id)}?popup=1",
                 "needs_reauth": needs_reauth,
             })
+        if multi:
+            # Multi-connection api_key/oauth plugins keep their kind's
+            # fields above and add the per-connection list; `connected`
+            # becomes "any connection is connected".
+            from auth.connections import multi_connection_fields
+            plugin_row.update(multi_connection_fields(plugin, user))
         connectors.append(plugin_row)
 
     return {"connectors": connectors}
