@@ -350,6 +350,10 @@ class ModelSpec:
     vertex_region: str | None = None
     thinking_effort: str | None = None
     refusal_fallback_models: tuple[str, ...] = field(default_factory=tuple)
+    # NEAR AI models only: "enclave" (NEAR's own hardware-attested TEE
+    # fleet) or "proxy" (relayed to a third party), from the catalog
+    # snapshot. Informational -- a badge in Settings, enforced nowhere.
+    tee: str | None = None
 
     @property
     def family(self) -> str | None:
@@ -403,6 +407,7 @@ def _instance_spec(instance: dict, model: dict | None, wire_id: str) -> ModelSpe
         instance_id=instance["id"],
         enabled=bool(model) and model.get("enabled", True),
         listed=bool(model),
+        tee=model.get("tee"),
     )
 
 

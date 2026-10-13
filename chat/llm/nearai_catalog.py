@@ -24,6 +24,18 @@ capabilities for the typeahead (an entry whose feature list is empty is
 treated as "unknown", not "no tools": NEAR AI publishes empty feature lists
 on freshly added models).
 
+A second public endpoint, ``GET /v1/model/list`` (paginated ``{"models":
+[...], "total": n}``), carries each model's TEE metadata under
+``metadata``: ``providerType`` (``"vllm"`` = NEAR's own TEE fleet,
+``"external"`` / ``"chutes"`` = relayed to a third-party provider),
+``verifiable`` and ``attestationSupported``. :func:`classify_entry`
+reduces them to one ``tee`` label per model -- ``"enclave"`` only when all
+three say so, ``"proxy"`` for everything else incl. missing metadata (fail
+closed) -- which the admin model rows show as an Enclave / Proxy badge.
+Informational only: nothing enforces it and no attestation is verified.
+The metadata list is best effort; when it cannot be fetched every model is
+labelled ``proxy`` and the failure is logged.
+
 Settings > Inference Providers uses the result the same two ways as the
 OpenRouter catalog: the "Add model" typeahead on a NEAR AI card searches it
 (``GET /admin/inference-providers/instances/<id>/catalog?q=``, served
@@ -37,6 +49,10 @@ The normalized list is cached in ``data/nearai_catalog.json`` for
 failed fetch keeps serving the stale cache -- or an empty list when there
 never was one -- with the error reported alongside, so the UI falls back to
 custom-id entry.
+
+The NEAR AI health check (``OpenRouterProvider.check_model_access``) is a
+lookup in this catalog rather than a billed completion, so the cache is
+also what the startup sweep consults.
 """
 
 import json
@@ -49,13 +65,22 @@ import urllib.error
 import urllib.request
 
 from chat.llm.openrouter_catalog import normalize_openrouter_entry
+from config.inference_providers import TEE_LABELS
 from config.paths import NEARAI_CATALOG_FILE
 
 logger = logging.getLogger(__name__)
 
 CATALOG_URL = "https://cloud-api.near.ai/v1/models"
+# Per-model TEE metadata (public, paginated with ``limit`` / ``offset``)
+MODEL_LIST_URL = "https://cloud-api.near.ai/v1/model/list"
+MODEL_LIST_PAGE_SIZE = 100
+MODEL_LIST_MAX_PAGES = 20
 CATALOG_TTL_SECONDS = 24 * 60 * 60
 FETCH_TIMEOUT_SECONDS = 15
+
+TEE_ENCLAVE, TEE_PROXY = TEE_LABELS
+# NEAR's ``providerType`` for models served on its own TEE fleet
+TEE_PROVIDER_TYPE = "vllm"
 
 # Text-in text-out entries that are nevertheless not chat models (their
 # descriptions say "embedding and ranking tasks"); matched on the wire id.
@@ -97,12 +122,32 @@ def is_chat_model(raw: dict) -> bool:
     return not (isinstance(wire_id, str) and _NON_CHAT_ID_RE.search(wire_id))
 
 
-def _normalize_entry(raw) -> dict | None:
+def classify_entry(tee_fields: dict | None) -> str:
+    """``"enclave"`` or ``"proxy"`` from one model's TEE metadata
+    (``provider_type`` / ``verifiable`` / ``attestation_supported`` as
+    parsed by :func:`fetch_tee_metadata`).
+
+    Enclave only on NEAR's positive signal in all three fields; every
+    other case, including missing metadata, is ``"proxy"`` (fail closed).
+    """
+    if not isinstance(tee_fields, dict):
+        return TEE_PROXY
+    if (
+        tee_fields.get("provider_type") == TEE_PROVIDER_TYPE
+        and tee_fields.get("verifiable") is True
+        and tee_fields.get("attestation_supported") is True
+    ):
+        return TEE_ENCLAVE
+    return TEE_PROXY
+
+
+def _normalize_entry(raw, tee_fields: dict | None = None) -> dict | None:
     """Normalize one ``/v1/models`` entry; None when unusable or not a chat
     model. The OpenRouter-shaped base fields (id, name, context, output
     cap, $/1M prices) come from the shared normalizer; ``capabilities``
     (``tools`` / ``vision``) and the typeahead ``detail`` are added from
-    NEAR AI's feature and modality lists."""
+    NEAR AI's feature and modality lists, and ``tee`` from the model's
+    ``/v1/model/list`` metadata (``tee_fields``; None -> ``proxy``)."""
     if not isinstance(raw, dict) or not is_chat_model(raw):
         return None
     entry = normalize_openrouter_entry(raw)
@@ -125,6 +170,7 @@ def _normalize_entry(raw) -> dict | None:
         bits.append("reasoning")
     entry["detail"] = " · ".join(bits)
     entry["capabilities"] = capabilities
+    entry["tee"] = classify_entry(tee_fields)
     return entry
 
 
@@ -151,6 +197,9 @@ def _cached_entry(raw) -> dict | None:
         "capabilities": (
             [c for c in capabilities if isinstance(c, str)] if isinstance(capabilities, list) else None
         ),
+        # A cache written before the label existed has no ``tee``: proxy
+        # until the TTL refresh (fail closed)
+        "tee": raw["tee"] if raw.get("tee") in TEE_LABELS else TEE_PROXY,
     }
 
 
@@ -189,24 +238,84 @@ def _write_cache(cache: dict) -> None:
         raise
 
 
-def fetch_catalog() -> list[dict]:
-    """Download and normalize the live catalog (blocking; raises
-    :class:`NearAICatalogError` on failure). No key: the list is public."""
-    request = urllib.request.Request(CATALOG_URL, headers={"Accept": "application/json"})
+def _get_json(url: str):
+    """GET one public JSON document (blocking; raises
+    :class:`NearAICatalogError` on any transport or decode failure)."""
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT_SECONDS) as response:
-            payload = json.load(response)
+            return json.load(response)
     except urllib.error.HTTPError as exc:
         raise NearAICatalogError(f"HTTP {exc.code}") from exc
     except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
         raise NearAICatalogError(str(exc) or exc.__class__.__name__) from exc
+
+
+def _bool_or_none(value) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _tee_from_list_item(item) -> tuple[str, dict] | None:
+    """``(wire_id, {provider_type, verifiable, attestation_supported})``
+    from one ``/v1/model/list`` item; None when it names no model."""
+    if not isinstance(item, dict):
+        return None
+    model_id = item.get("modelId")
+    meta = item.get("metadata")
+    if not isinstance(model_id, str) or not model_id or not isinstance(meta, dict):
+        return None
+    provider_type = meta.get("providerType")
+    return model_id, {
+        "provider_type": provider_type if isinstance(provider_type, str) else None,
+        "verifiable": _bool_or_none(meta.get("verifiable")),
+        "attestation_supported": _bool_or_none(meta.get("attestationSupported")),
+    }
+
+
+def fetch_tee_metadata() -> dict[str, dict]:
+    """``{wire_id: {provider_type, verifiable, attestation_supported}}``
+    from the public ``/v1/model/list`` (blocking; raises
+    :class:`NearAICatalogError` on failure). Follows ``offset`` pagination
+    until ``total`` is reached, the list ends or the page cap is hit."""
+    out: dict[str, dict] = {}
+    offset = 0
+    for _ in range(MODEL_LIST_MAX_PAGES):
+        payload = _get_json(f"{MODEL_LIST_URL}?limit={MODEL_LIST_PAGE_SIZE}&offset={offset}")
+        items = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise NearAICatalogError("Unexpected model metadata response shape")
+        for item in items:
+            parsed = _tee_from_list_item(item)
+            if parsed:
+                out[parsed[0]] = parsed[1]
+        total = payload.get("total")
+        offset += len(items)
+        if not items or not isinstance(total, int) or offset >= total:
+            break
+    return out
+
+
+def fetch_catalog() -> list[dict]:
+    """Download and normalize the live catalog (blocking; raises
+    :class:`NearAICatalogError` on failure). No key: both lists are public.
+
+    The model list is required; the TEE metadata list is best effort --
+    its failure is logged and every model is labelled ``proxy``.
+    """
+    payload = _get_json(CATALOG_URL)
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list):
         raise NearAICatalogError("Unexpected model list response shape")
+    try:
+        tee_by_id = fetch_tee_metadata()
+    except NearAICatalogError as exc:
+        logger.warning("NEAR AI model metadata unavailable (every model labelled proxy): %s", exc)
+        tee_by_id = {}
     models: list[dict] = []
     seen: set[str] = set()
     for raw in data:
-        entry = _normalize_entry(raw)
+        wire_id = raw.get("id") if isinstance(raw, dict) else None
+        entry = _normalize_entry(raw, tee_by_id.get(wire_id) if isinstance(wire_id, str) else None)
         if entry is not None and entry["id"] not in seen:
             seen.add(entry["id"])
             models.append(entry)

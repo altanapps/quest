@@ -14,7 +14,11 @@ AI Cloud** (kind ``nearai``, ``https://cloud-api.near.ai/v1``) and
 ``upstream_url`` with the instance's bearer API key and no OpenRouter-only
 extensions (both include usage in the final streamed chunk by themselves,
 NEAR AI with the ``prompt_tokens_details.cached_tokens`` split of its
-automatic prompt cache) -- and
+automatic prompt cache). NEAR AI requests additionally carry the
+``x-no-aliasing: true`` default header so the gateway never substitutes
+another model for the one asked for, and a NEAR AI health check is a
+lookup in the public catalog instead of a billed completion (see
+:meth:`OpenRouterProvider.check_model_access`) -- and
 **self-hosted** instances (kind ``local`` with API type ``openai``): the
 instance's own base URL replaces OpenRouter's, the key is optional (sent
 as a bearer token only when stored) and the OpenRouter-only request
@@ -116,6 +120,12 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # to send and they identify this deployment's traffic in the OpenRouter
 # dashboard.
 _OPENROUTER_HEADERS = {"X-Title": "Quest"}
+# NEAR AI Cloud: never let the gateway substitute another model for the one
+# requested -- the model's identity is the point of a confidential-inference
+# provider (which model ran, in which enclave). A client default header, so
+# it rides on every request of the instance.
+NEARAI_KIND = "nearai"
+_NEARAI_HEADERS = {"x-no-aliasing": "true"}
 
 
 @dataclass
@@ -159,7 +169,8 @@ class OpenRouterProvider(LLMProvider):
         exists (the openai SDK insists on a non-empty key, so a placeholder
         is sent otherwise -- local servers without ``--api-key`` ignore it).
         ``openrouter`` flags the one upstream whose request extensions
-        (accounting opt-in, attribution headers) apply.
+        (accounting opt-in, attribution headers) apply; NEAR AI instances
+        get their own default header (``x-no-aliasing``).
 
         Raises:
             ValueError: descriptive "not configured" message for the admin.
@@ -199,12 +210,24 @@ class OpenRouterProvider(LLMProvider):
                 "Providers (admin only)."
             )
         is_openrouter = kind_name == LEGACY_OPENROUTER_INSTANCE_ID
+        headers = None
+        if is_openrouter:
+            headers = _OPENROUTER_HEADERS
+        elif kind_name == NEARAI_KIND:
+            headers = _NEARAI_HEADERS
         return {
             "base_url": kind["upstream_url"] or OPENROUTER_BASE_URL,
             "api_key": api_key,
-            "headers": _OPENROUTER_HEADERS if is_openrouter else None,
+            "headers": headers,
             "openrouter": is_openrouter,
         }
+
+    def _instance_kind(self) -> str | None:
+        """The configured kind of this instance (None when it has no entry)."""
+        from config.inference_providers import get_instance
+
+        instance = get_instance(self.instance_id)
+        return instance["kind"] if instance is not None else None
 
     def _get_client(self):
         """Return a cached AsyncOpenAI client for this instance's endpoint.
@@ -244,13 +267,50 @@ class OpenRouterProvider(LLMProvider):
         Used by the admin inference-provider health check: catches a revoked
         or unfunded key, a model id OpenRouter no longer serves, and quota
         exhaustion. max_tokens=1 keeps the cost negligible.
+
+        NEAR AI instances are checked against the public catalog instead
+        (:meth:`_check_nearai_catalog`): the startup sweep checks every
+        configured model on every boot and NEAR AI documents no rate
+        limits, so a billed completion per model per restart buys little --
+        a key problem surfaces on the first real turn with NEAR AI's own
+        auth error.
         """
+        if self._instance_kind() == NEARAI_KIND:
+            await self._check_nearai_catalog(model)
+            return
         client = self._get_client()
         await client.chat.completions.create(
             model=self._get_openrouter_model_id(model),
             max_tokens=1,
             messages=[{"role": "user", "content": "ok"}],
         )
+
+    async def _check_nearai_catalog(self, model: str) -> None:
+        """Health check without a paid call: the model must be in NEAR AI's
+        catalog, and not listed without tool calling (Quest's agent loop
+        sends tools on every request). The endpoint is still resolved first
+        so a missing key is reported like for every other kind.
+
+        Raises:
+            ValueError: unconfigured key, model not listed, catalog
+                unreachable with no cache to fall back on, or no tool support.
+        """
+        from chat.llm.nearai_catalog import get_catalog
+
+        self._endpoint()
+        wire_id = self._get_openrouter_model_id(model)
+        catalog = await asyncio.to_thread(get_catalog)
+        entry = next((m for m in catalog["models"] if m["id"] == wire_id), None)
+        if entry is None:
+            if catalog["error"] and not catalog["models"]:
+                raise ValueError(f"NEAR AI catalog unavailable: {catalog['error']}")
+            raise ValueError(f"Model {wire_id!r} is not in NEAR AI's catalog.")
+        capabilities = entry.get("capabilities")
+        if isinstance(capabilities, list) and "tools" not in capabilities:
+            raise ValueError(
+                f"NEAR AI lists {wire_id!r} without tool-calling support; "
+                "Quest's agent loop needs tool calling."
+            )
 
     def create_session(
         self,

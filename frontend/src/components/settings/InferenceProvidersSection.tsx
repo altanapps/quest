@@ -17,6 +17,7 @@ import type {
   InferenceModelInfo,
   InferenceProvidersListResponse,
   OpenRouterCatalogModel,
+  TeeLabel,
   VertexProviderStatus,
   VertexSectionInfo,
 } from '../../api/types';
@@ -306,6 +307,7 @@ function ModelRow({
         </span>
         {/* Always rendered (possibly empty) so the grid columns stay put */}
         <span className="inf-prov-model-display" title={showName ? model.display_name : undefined}>
+          {model.tee && <TeeBadge tee={model.tee} />}
           {showName ? model.display_name : ''}
         </span>
         <span className="inf-prov-model-controls">
@@ -358,6 +360,20 @@ function ModelRow({
         />
       )}
     </div>
+  );
+}
+
+const TEE_TITLES: Record<TeeLabel, string> = {
+  enclave: 'Runs inside NEAR AI Cloud\u2019s own hardware-attested TEE fleet (Intel TDX + NVIDIA TEE GPUs), per NEAR AI\u2019s catalog. Informational only.',
+  proxy: 'Relayed by NEAR AI Cloud to a third-party provider; not served from NEAR\u2019s own enclaves, per NEAR AI\u2019s catalog. Informational only.',
+};
+
+/** NEAR AI model rows: where the model runs, per NEAR AI's catalog. */
+function TeeBadge({ tee }: { tee: TeeLabel }) {
+  return (
+    <span className={`inf-prov-tee-badge ${tee}`} title={TEE_TITLES[tee]}>
+      {tee === 'enclave' ? 'Enclave' : 'Proxy'}
+    </span>
   );
 }
 
@@ -547,6 +563,8 @@ function formatContext(tokens: number | null): string {
 /** One typeahead row's muted second line. */
 function catalogMeta(m: OpenRouterCatalogModel): string {
   const bits = [m.name];
+  // NEAR AI: where the model runs (enclave / proxy) is worth knowing before adding it
+  if (m.tee) bits.push(m.tee);
   if (m.detail) bits.push(m.detail);
   if (m.context_length) bits.push(formatContext(m.context_length));
   if (m.capabilities && !m.capabilities.includes('tools')) bits.push('no tool support');
@@ -963,7 +981,9 @@ function InstanceCard({
         '(accounts/<account>/deployments/<id>) can be typed in as a custom id.'
       : catalog === 'nearai'
         ? 'NEAR AI model ids are <vendor>/<model> slugs such as deepseek/deepseek-v3.2; ' +
-          'the catalog lists the chat models with their current prices.'
+          'the catalog lists the chat models with their current prices. Enclave marks a model ' +
+          'NEAR AI serves on its own hardware-attested TEE fleet, Proxy one it relays to a ' +
+          'third-party provider (per NEAR AI\u2019s catalog; nothing is verified here).'
         : catalog === 'trustedrouter'
           ? 'TrustedRouter model ids are <vendor>/<model> slugs such as deepseek/deepseek-v4-flash-0731, ' +
             'plus routes such as trustedrouter/auto; the catalog lists the chat models with their current prices.'

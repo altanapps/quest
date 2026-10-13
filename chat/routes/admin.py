@@ -1177,7 +1177,8 @@ def _model_view(spec, statuses: dict) -> dict:
     sweep and admin rechecks), or None when the model was never checked.
     ``discontinued_on`` is the provider's announced shutdown date (registry
     metadata, Vertex only); past that date the model is deprecated and
-    no longer listed here at all.
+    no longer listed here at all. ``tee`` is the NEAR AI catalog's
+    enclave / proxy label from the model's snapshot (None elsewhere).
     """
     return {
         "id": spec.id,
@@ -1187,6 +1188,7 @@ def _model_view(spec, statuses: dict) -> dict:
         "enabled": spec.enabled,
         "max_input_tokens": spec.max_input_tokens,
         "discontinued_on": spec.discontinued_on,
+        "tee": spec.tee,
         "status": statuses.get(spec.id),
     }
 
@@ -1635,7 +1637,7 @@ async def admin_instance_catalog(
     - NEAR AI instances: NEAR AI Cloud's public model list (cached 24h,
       ``refresh=true`` re-fetches), served whether or not a key is saved
       yet; a failed fetch sets ``error`` with the stale cache or an
-      empty list.
+      empty list. Each row carries its ``tee`` label (enclave / proxy).
     - TrustedRouter instances: TrustedRouter's public model list, served
       the same way as NEAR AI's (cached 24h, keyless, stale on failure).
 

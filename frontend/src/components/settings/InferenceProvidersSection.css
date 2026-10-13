@@ -499,3 +499,26 @@
     color: #dc2626;
   }
 }
+
+/* NEAR AI rows: where the model runs per NEAR AI's catalog (badge only --
+   nothing enforces it) */
+.inf-prov-tee-badge {
+  display: inline-block;
+  margin-right: 0.4rem;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  font-size: 0.625rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  line-height: 1.4;
+  vertical-align: middle;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+
+.inf-prov-tee-badge.enclave {
+  color: var(--accent-text);
+  border-color: rgb(var(--accent-rgb) / 0.45);
+  background: rgb(var(--accent-rgb) / 0.12);
+}

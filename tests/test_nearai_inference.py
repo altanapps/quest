@@ -196,15 +196,28 @@ def test_openrouter_provider_endpoint_for_nearai_instance():
     assert endpoint == {
         "base_url": NEARAI_URL,
         "api_key": "sk-near",
-        "headers": None,
+        # NEAR AI never substitutes another model for the requested one
+        "headers": {"x-no-aliasing": "true"},
         "openrouter": False,
     }
-    # The client is built on the NEAR AI URL and the OpenRouter-only
-    # request extras are switched off
+    # The client is built on the NEAR AI URL with the no-aliasing header as
+    # a default header (so it rides on every request), and the
+    # OpenRouter-only request extras are switched off
     client = provider._get_client()
     assert str(client.base_url).rstrip("/") == NEARAI_URL
+    assert client.default_headers["x-no-aliasing"] == "true"
+    assert "X-Title" not in client.default_headers
     assert provider._is_openrouter is False
     assert NEARAI_URL != OPENROUTER_BASE_URL
+
+
+def test_no_aliasing_header_is_nearai_only():
+    ip.upsert_instance({"id": "openrouter", "kind": "openrouter", "label": "OR", "models": []})
+    ip.write_inference_credentials("openrouter", {"api_key": "sk-or"})
+    assert OpenRouterProvider("openrouter")._endpoint()["headers"] == {"X-Title": "Quest"}
+    ip.upsert_instance({"id": "fireworks", "kind": "fireworks", "label": "FW", "models": []})
+    ip.write_inference_credentials("fireworks", {"api_key": "fw-key"})
+    assert OpenRouterProvider("fireworks")._endpoint()["headers"] is None
 
 
 def test_provider_singleton_per_nearai_instance(monkeypatch):
@@ -236,6 +249,8 @@ def test_normalize_entry_shape():
         "pricing": {"prompt": pytest.approx(0.3), "completion": pytest.approx(1.2), "cache_read": pytest.approx(0.006)},
         "detail": "vision · reasoning",
         "capabilities": ["tools", "vision"],
+        # No TEE metadata passed -> proxy (fail closed)
+        "tee": "proxy",
     }
     # No cache-read price -> plain prompt/completion pricing
     entry = na._normalize_entry(_raw("qwen/qwen3.7-max", cache_read=None, features=("tools", "json_mode")))
@@ -280,12 +295,28 @@ def test_normalize_entry_filters_non_chat_models():
 # Catalog fetch / cache
 # ---------------------------------------------------------------------------
 
+def _meta(wire_id, *, provider_type="vllm", verifiable=True, attestation=True):
+    """One ``GET /v1/model/list`` item (the TEE metadata list)."""
+    return {
+        "modelId": wire_id,
+        "inputCostPerToken": {"amount": 300, "scale": 9, "currency": "USD"},
+        "metadata": {
+            "verifiable": verifiable, "providerType": provider_type,
+            "attestationSupported": attestation, "contextLength": 1048576,
+            "modelDisplayName": wire_id.rsplit("/", 1)[-1],
+        },
+    }
+
+
 @pytest.fixture
 def fake_urlopen(monkeypatch):
-    """Stub ``urllib.request.urlopen``: ``state["payload"]`` is returned as
-    the JSON body (an Exception value is raised instead); every request is
-    recorded in ``state["seen"]``."""
-    state: dict = {"payload": None, "seen": []}
+    """Stub ``urllib.request.urlopen``. Requests to the model list return
+    ``state["payload"]`` as the JSON body (an Exception value is raised
+    instead) and are recorded in ``state["seen"]``; requests to the TEE
+    metadata list return ``state["metadata"]`` (a list = one page holding
+    it, a dict = that payload, an Exception = raised) and are recorded in
+    ``state["seen_metadata"]``."""
+    state: dict = {"payload": None, "metadata": [], "seen": [], "seen_metadata": []}
 
     class _Response(io.BytesIO):
         def __enter__(self):
@@ -295,8 +326,14 @@ def fake_urlopen(monkeypatch):
             self.close()
 
     def urlopen(request, timeout=None):
-        state["seen"].append(request)
-        target = state["payload"]
+        if request.full_url.startswith(na.MODEL_LIST_URL):
+            state["seen_metadata"].append(request)
+            target = state["metadata"]
+            if isinstance(target, list):
+                target = {"models": target, "total": len(target)}
+        else:
+            state["seen"].append(request)
+            target = state["payload"]
         if isinstance(target, Exception):
             raise target
         return _Response(json.dumps(target).encode())
@@ -375,7 +412,7 @@ def test_cache_round_trip_keeps_shape(fake_urlopen):
     # A hand-edited cache row missing fields degrades gracefully
     assert na._cached_entry({"id": "x", "pricing": {"prompt": 1}}) == {
         "id": "x", "name": "x", "context_length": None, "max_completion_tokens": None,
-        "pricing": None, "detail": "", "capabilities": None,
+        "pricing": None, "detail": "", "capabilities": None, "tee": "proxy",
     }
 
 
@@ -391,6 +428,224 @@ def test_search_and_snapshot_apply_to_nearai_entries():
         "name": "DeepSeek V3.2", "context_length": 1048576, "max_completion_tokens": None,
         "pricing": {"prompt": 0.3, "completion": 1.2},
     }
+    # The tee label rides along when the entry carries one (NEAR AI only)
+    models[1]["tee"] = "enclave"
+    assert catalog_snapshot(models, "moonshotai/kimi-k3")["tee"] == "enclave"
+
+
+# ---------------------------------------------------------------------------
+# TEE metadata (enclave / proxy label)
+# ---------------------------------------------------------------------------
+
+def test_classify_entry_fails_closed():
+    enclave = {"provider_type": "vllm", "verifiable": True, "attestation_supported": True}
+    assert na.classify_entry(enclave) == "enclave"
+    assert na.classify_entry({**enclave, "provider_type": "external"}) == "proxy"
+    assert na.classify_entry({**enclave, "provider_type": "chutes"}) == "proxy"
+    assert na.classify_entry({**enclave, "verifiable": False}) == "proxy"
+    assert na.classify_entry({**enclave, "attestation_supported": None}) == "proxy"
+    assert na.classify_entry(None) == "proxy"
+    assert na.classify_entry({}) == "proxy"
+    assert na.TEE_LABELS == ("enclave", "proxy") == ip.TEE_LABELS
+
+
+def test_normalize_entry_carries_tee_label():
+    enclave = na._normalize_entry(
+        _raw("deepseek/deepseek-v3.2", features=("tools", "reasoning")),
+        {"provider_type": "vllm", "verifiable": True, "attestation_supported": True},
+    )
+    assert enclave["tee"] == "enclave" and enclave["detail"] == "reasoning"
+    proxy = na._normalize_entry(_raw("anthropic/claude-sonnet-5", inputs=("text", "image")))
+    assert proxy["tee"] == "proxy" and proxy["detail"] == "vision"
+
+
+def test_fetch_catalog_merges_tee_metadata_across_pages(fake_urlopen, monkeypatch):
+    monkeypatch.setattr(na, "MODEL_LIST_PAGE_SIZE", 2)
+    fake_urlopen["payload"] = {"data": [
+        _raw("deepseek/deepseek-v3.2"), _raw("anthropic/claude-sonnet-5"),
+        _raw("moonshotai/kimi-k3"), _raw("vendor/unlisted-in-metadata"),
+    ]}
+    pages = [
+        {"models": [_meta("deepseek/deepseek-v3.2"), _meta("anthropic/claude-sonnet-5", provider_type="external", verifiable=False, attestation=False)], "total": 3},
+        {"models": [_meta("moonshotai/kimi-k3", verifiable=False)], "total": 3},
+    ]
+    state = {"i": 0}
+    real_urlopen = urllib.request.urlopen
+
+    def paged(request, timeout=None):
+        if request.full_url.startswith(na.MODEL_LIST_URL):
+            fake_urlopen["seen_metadata"].append(request)
+            page = pages[state["i"]]
+            state["i"] += 1
+            return io.BytesIO(json.dumps(page).encode())
+        return real_urlopen(request, timeout=timeout)
+
+    monkeypatch.setattr(urllib.request, "urlopen", paged)
+    models = {m["id"]: m["tee"] for m in na.fetch_catalog()}
+    assert models == {
+        "anthropic/claude-sonnet-5": "proxy",
+        "deepseek/deepseek-v3.2": "enclave",
+        "moonshotai/kimi-k3": "proxy",
+        "vendor/unlisted-in-metadata": "proxy",
+    }
+    urls = [r.full_url for r in fake_urlopen["seen_metadata"]]
+    assert urls == [f"{na.MODEL_LIST_URL}?limit=2&offset=0", f"{na.MODEL_LIST_URL}?limit=2&offset=2"]
+    # Exactly one model-list request alongside
+    assert len(fake_urlopen["seen"]) == 1
+
+
+def test_fetch_catalog_survives_metadata_failure(fake_urlopen, caplog):
+    fake_urlopen["payload"] = {"data": [_raw("deepseek/deepseek-v3.2")]}
+    fake_urlopen["metadata"] = urllib.error.HTTPError(na.MODEL_LIST_URL, 500, "boom", {}, io.BytesIO(b""))
+    with caplog.at_level("WARNING", logger="chat.llm.nearai_catalog"):
+        models = na.fetch_catalog()
+    assert [m["tee"] for m in models] == ["proxy"]
+    assert "model metadata unavailable" in caplog.text
+    # A malformed metadata page degrades the same way
+    fake_urlopen["metadata"] = {"nope": 1}
+    assert [m["tee"] for m in na.fetch_catalog()] == ["proxy"]
+
+
+def test_cache_round_trip_keeps_tee_and_old_cache_defaults_to_proxy(fake_urlopen):
+    fake_urlopen["payload"] = {"data": [_raw("deepseek/deepseek-v3.2"), _raw("moonshotai/kimi-k3")]}
+    fake_urlopen["metadata"] = [_meta("deepseek/deepseek-v3.2")]
+    first = na.get_catalog()["models"]
+    assert {m["id"]: m["tee"] for m in first} == {"deepseek/deepseek-v3.2": "enclave", "moonshotai/kimi-k3": "proxy"}
+    assert na.get_catalog()["models"] == first and len(fake_urlopen["seen"]) == 1
+    # A cache written before the label existed is served as proxy
+    cache = json.loads(na.NEARAI_CATALOG_FILE.read_text())
+    for m in cache["models"]:
+        m.pop("tee")
+    cache["models"][1]["tee"] = "bogus"
+    na.NEARAI_CATALOG_FILE.write_text(json.dumps(cache))
+    assert [m["tee"] for m in na.get_catalog()["models"]] == ["proxy", "proxy"]
+
+
+def test_instance_model_keeps_only_known_tee_labels():
+    assert ip.normalize_instance_model({"id": "a/b", "tee": "enclave"})["tee"] == "enclave"
+    assert ip.normalize_instance_model({"id": "a/b", "tee": "proxy"})["tee"] == "proxy"
+    assert "tee" not in ip.normalize_instance_model({"id": "a/b", "tee": "secure"})
+    assert "tee" not in ip.normalize_instance_model({"id": "a/b"})
+    assert "tee" not in ip.normalize_instance_model("a/b")
+
+
+def test_resolve_model_exposes_tee():
+    from chat.llm.config import resolve_model
+
+    ip.upsert_instance(_nearai(models=[
+        {"id": "deepseek/deepseek-v3.2", "tee": "enclave"}, {"id": "vendor/custom"},
+    ]))
+    assert resolve_model("nearai:deepseek/deepseek-v3.2").tee == "enclave"
+    assert resolve_model("nearai:vendor/custom").tee is None
+    ip.upsert_instance({"id": "openrouter", "kind": "openrouter", "label": "OR", "models": ["deepseek/deepseek-v3.2"]})
+    assert resolve_model("openrouter:deepseek/deepseek-v3.2").tee is None
+
+
+# ---------------------------------------------------------------------------
+# Health check: catalog lookup instead of a billed completion
+# ---------------------------------------------------------------------------
+
+class _NoCompletions:
+    """An openai client stand-in whose completion call must never run."""
+
+    class chat:
+        class completions:
+            @staticmethod
+            async def create(**kwargs):
+                raise AssertionError(f"billed completion issued: {kwargs}")
+
+
+def test_nearai_health_check_is_a_catalog_lookup(monkeypatch):
+    calls: list[bool] = []
+
+    def fake_get_catalog(refresh=False):
+        calls.append(refresh)
+        return {
+            "models": [
+                _catalog_entry("deepseek/deepseek-v3.2", "DeepSeek"),
+                _catalog_entry("vendor/unknown-caps", "Unknown", capabilities=None),
+                _catalog_entry("vendor/no-tools", "No tools", capabilities=("vision",)),
+            ],
+            "fetched_at": time.time(), "stale": False, "error": None,
+        }
+
+    monkeypatch.setattr(na, "get_catalog", fake_get_catalog)
+    ip.upsert_instance(_nearai(models=["deepseek/deepseek-v3.2"]))
+    provider = OpenRouterProvider("nearai")
+    provider._client = _NoCompletions()
+    # No key yet: reported like every other kind, before any catalog read
+    with pytest.raises(ValueError, match="NEAR AI API key not configured"):
+        _run(provider.check_model_access("nearai:deepseek/deepseek-v3.2"))
+    assert calls == []
+    ip.write_inference_credentials("nearai", {"api_key": "sk-near"})
+    _run(provider.check_model_access("nearai:deepseek/deepseek-v3.2"))
+    # Unknown capabilities claim nothing, so the model passes
+    _run(provider.check_model_access("nearai:vendor/unknown-caps"))
+    assert calls == [False, False]
+    with pytest.raises(ValueError, match="not in NEAR AI's catalog"):
+        _run(provider.check_model_access("nearai:vendor/not-listed"))
+    with pytest.raises(ValueError, match="without tool-calling support"):
+        _run(provider.check_model_access("nearai:vendor/no-tools"))
+
+
+def test_nearai_health_check_reports_unreachable_catalog(monkeypatch):
+    monkeypatch.setattr(na, "get_catalog", lambda refresh=False: {
+        "models": [], "fetched_at": None, "stale": True, "error": "<urlopen error offline>",
+    })
+    ip.upsert_instance(_nearai(models=["deepseek/deepseek-v3.2"]))
+    ip.write_inference_credentials("nearai", {"api_key": "sk-near"})
+    provider = OpenRouterProvider("nearai")
+    provider._client = _NoCompletions()
+    with pytest.raises(ValueError, match="NEAR AI catalog unavailable: <urlopen error offline>"):
+        _run(provider.check_model_access("nearai:deepseek/deepseek-v3.2"))
+    # A stale cache is still a catalog: a listed model passes, an unlisted one fails plainly
+    monkeypatch.setattr(na, "get_catalog", lambda refresh=False: {
+        "models": [_catalog_entry("deepseek/deepseek-v3.2", "DeepSeek")],
+        "fetched_at": 1.0, "stale": True, "error": "HTTP 503",
+    })
+    _run(provider.check_model_access("nearai:deepseek/deepseek-v3.2"))
+    with pytest.raises(ValueError, match="not in NEAR AI's catalog"):
+        _run(provider.check_model_access("nearai:vendor/other"))
+
+
+def test_other_kinds_still_issue_the_minimal_completion(monkeypatch):
+    seen: list[dict] = []
+
+    class _Client:
+        class chat:
+            class completions:
+                @staticmethod
+                async def create(**kwargs):
+                    seen.append(kwargs)
+
+    monkeypatch.setattr(na, "get_catalog", lambda refresh=False: pytest.fail("catalog consulted"))
+    ip.upsert_instance({"id": "fireworks", "kind": "fireworks", "label": "FW", "models": []})
+    ip.write_inference_credentials("fireworks", {"api_key": "fw-key"})
+    provider = OpenRouterProvider("fireworks")
+    provider._client = _Client()
+    _run(provider.check_model_access("fireworks:accounts/fireworks/models/x"))
+    assert seen == [{
+        "model": "accounts/fireworks/models/x", "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ok"}],
+    }]
+
+
+def test_check_model_uses_catalog_for_nearai_through_health(monkeypatch, tmp_path):
+    """End to end through chat.llm.health: a NEAR AI verdict comes from the
+    catalog, with the lookup error extracted as the stored message."""
+    import chat.llm.health as health
+
+    monkeypatch.setattr(health, "_store", health.ModelHealthStore(tmp_path / "model_health.json"))
+    monkeypatch.setattr(na, "get_catalog", lambda refresh=False: {
+        "models": [_catalog_entry("deepseek/deepseek-v3.2", "DeepSeek")],
+        "fetched_at": time.time(), "stale": False, "error": None,
+    })
+    ip.upsert_instance(_nearai(models=["deepseek/deepseek-v3.2", "vendor/gone"]))
+    ip.write_inference_credentials("nearai", {"api_key": "sk-near"})
+    ok = _run(health.check_model("nearai:deepseek/deepseek-v3.2"))
+    assert ok["ok"] is True
+    bad = _run(health.check_model("nearai:vendor/gone"))
+    assert bad["ok"] is False and "not in NEAR AI's catalog" in bad["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -449,10 +704,10 @@ def test_admin_update_nearai_models_snapshot_from_catalog(admin, monkeypatch):
     def fake_get_catalog(refresh=False):
         calls.append(refresh)
         return {
-            "models": [_catalog_entry(
+            "models": [{**_catalog_entry(
                 "deepseek/deepseek-v3.2", "DeepSeek V3.2", context=128000,
                 pricing={"prompt": 0.3, "completion": 1.2, "cache_read": 0.006},
-            )],
+            ), "tee": "enclave"}],
             "fetched_at": time.time(), "stale": False, "error": None,
         }
 
@@ -471,7 +726,12 @@ def test_admin_update_nearai_models_snapshot_from_catalog(admin, monkeypatch):
     assert rows["deepseek/deepseek-v3.2"]["id"] == "nearai:deepseek/deepseek-v3.2"
     assert rows["vendor/unlisted"]["display_name"] == "Custom"
     assert rows["vendor/unlisted"]["max_input_tokens"] == ip.DEFAULT_INSTANCE_CONTEXT_LENGTH
+    # The enclave / proxy badge: from the snapshot, absent on custom ids
+    assert rows["deepseek/deepseek-v3.2"]["tee"] == "enclave"
+    assert rows["vendor/unlisted"]["tee"] is None
     stored = {m["id"]: m for m in ip.get_instance("nearai")["models"]}
+    assert stored["deepseek/deepseek-v3.2"]["tee"] == "enclave"
+    assert "tee" not in stored["vendor/unlisted"]
     # NEAR AI publishes prices: the snapshot carries them, incl. cache reads
     assert stored["deepseek/deepseek-v3.2"]["pricing"] == {"prompt": 0.3, "completion": 1.2, "cache_read": 0.006}
     assert stored["vendor/unlisted"]["pricing"] is None
