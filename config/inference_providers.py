@@ -154,7 +154,9 @@ INSTANCE_KINDS: dict[str, dict] = {
     # workspace API keys) and sent as a bearer token. Wire ids are
     # ``<vendor>/<model>`` slugs like OpenRouter's (``deepseek/deepseek-v3.2``,
     # ``anthropic/claude-sonnet-5``). Its model list is public and carries
-    # per-token prices, so the catalog module needs no key.
+    # per-token prices, so the catalog module needs no key; the public
+    # metadata list also says where each model runs (NEAR's own TEE fleet
+    # or a relayed third party), snapshotted as the model's ``tee`` label.
     "nearai": {
         "label": "NEAR AI",
         "hint": "sk-...",
@@ -493,11 +495,20 @@ def _normalize_pricing(value) -> dict | None:
     return out
 
 
+# Where a NEAR AI model runs, as snapshotted from its public catalog:
+# ``enclave`` = NEAR's own hardware-attested TEE fleet (Intel TDX + NVIDIA
+# TEE GPUs), ``proxy`` = relayed to a third-party provider. Informational
+# -- a badge on the admin model row; nothing enforces it and no attestation
+# is verified. Only NEAR AI snapshots carry it.
+TEE_LABELS = ("enclave", "proxy")
+
+
 def normalize_instance_model(entry) -> dict | None:
     """Normalize one instance model entry; None when it has no usable id.
 
     Accepts a bare wire-id string (enabled, no metadata) or the full dict
-    shape written by the admin endpoints. Unknown keys are dropped.
+    shape written by the admin endpoints. Unknown keys are dropped; the
+    optional ``tee`` label is kept only when it is one of :data:`TEE_LABELS`.
     """
     if isinstance(entry, str):
         entry = {"id": entry}
@@ -508,7 +519,7 @@ def normalize_instance_model(entry) -> dict | None:
         return None
     wire_id = wire_id.strip()
     name = entry.get("name")
-    return {
+    normalized = {
         "id": wire_id,
         "enabled": entry.get("enabled", True) is not False,
         "name": name.strip() if isinstance(name, str) and name.strip() else wire_id,
@@ -516,6 +527,9 @@ def normalize_instance_model(entry) -> dict | None:
         "max_completion_tokens": _as_positive_int(entry.get("max_completion_tokens"), None),
         "pricing": _normalize_pricing(entry.get("pricing")),
     }
+    if entry.get("tee") in TEE_LABELS:
+        normalized["tee"] = entry["tee"]
+    return normalized
 
 
 def _normalize_instance(entry) -> dict | None:

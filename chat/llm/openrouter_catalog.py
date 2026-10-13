@@ -210,13 +210,20 @@ def search_catalog(models: list[dict], query: str, limit: int = 20) -> list[dict
 
 
 def catalog_snapshot(models: list[dict], wire_id: str) -> dict | None:
-    """The metadata snapshot for one wire id, or None when not listed."""
+    """The metadata snapshot for one wire id, or None when not listed.
+
+    The NEAR AI catalog's ``tee`` label (enclave / proxy) rides along when
+    the entry carries one; other catalogs' entries have no such key.
+    """
     for model in models:
         if model["id"] == wire_id:
-            return {
+            snapshot = {
                 "name": model["name"],
                 "context_length": model["context_length"],
                 "max_completion_tokens": model["max_completion_tokens"],
                 "pricing": model["pricing"],
             }
+            if model.get("tee"):
+                snapshot["tee"] = model["tee"]
+            return snapshot
     return None

@@ -1752,9 +1752,15 @@ export interface InferenceModelInfo {
   // Provider-announced shutdown date ("YYYY-MM-DD", Vertex models only);
   // the server stops listing the model on that date
   discontinued_on: string | null;
+  // NEAR AI models only: where the model runs per NEAR AI's catalog -- in
+  // NEAR's own hardware-attested TEE fleet or relayed to a third party.
+  // Informational badge, enforced nowhere. null elsewhere.
+  tee: TeeLabel | null;
   // null when the model has never been health-checked
   status: InferenceModelStatus | null;
 }
+
+export type TeeLabel = 'enclave' | 'proxy';
 
 // Result of a live per-model health recheck (also the newly stored status)
 export interface InferenceModelTestResult extends InferenceModelStatus {
@@ -1860,6 +1866,8 @@ export interface OpenRouterCatalogModel {
   // (null = the catalog publishes none, so nothing is claimed)
   detail?: string;
   capabilities?: string[] | null;
+  // NEAR AI only: enclave / proxy (see InferenceModelInfo.tee)
+  tee?: TeeLabel;
 }
 
 // An instance's own catalog: the models a self-hosted server reports right
