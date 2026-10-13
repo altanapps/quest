@@ -82,21 +82,74 @@ def test_connectors_row_lists_connections_with_warning(imap_plugin, fake_imap):
 def test_admin_card_save_normalises_and_rejects(imap_plugin):
     spec = get_service_spec("imap")
     assert spec is not None
-    # The server-list field explains the host[:port] [ssl|starttls] format.
+    # The server list is a list field of host / security / port entries.
     (hosts_field,) = [f for f in fields_view(spec) if f["key"] == "allowed_hosts"]
-    assert hosts_field["type"] == "textarea"
+    assert hosts_field["type"] == "list"
     assert hosts_field["label"] == "IMAP servers"
-    assert "host[:port] [ssl|starttls]" in hosts_field["help"]
-    assert "993" in hosts_field["help"] and "143 starttls" in hosts_field["help"]
-    stored = resolve_update(
-        spec, {"allowed_hosts": "IMAP.Example.com\n\nimap.example.com:143\n[::1] StartTLS"}, None,
-    )
-    assert stored["allowed_hosts"] == (
-        "imap.example.com:993 ssl\nimap.example.com:143 starttls\n[::1]:143 starttls"
-    )
-    with pytest.raises(ValueError, match="Line 1"):
-        resolve_update(spec, {"allowed_hosts": "imaps://x"}, None)
-    with pytest.raises(ValueError, match="Line 2: duplicate of line 1"):
-        resolve_update(spec, {"allowed_hosts": "x.example\nx.example:993 ssl"}, None)
-    with pytest.raises(ValueError):
-        resolve_update(spec, {"allowed_hosts": ""}, None)
+    assert hosts_field["item_label"] == "server"
+    assert hosts_field["required"] is True
+    assert "removing a server disables" in hosts_field["help"]
+    items = {f["key"]: f for f in hosts_field["item_fields"]}
+    assert list(items) == ["host", "security", "port"]
+    assert items["host"]["required"] is True
+    assert items["security"] == {
+        **items["security"], "type": "select", "options": ["ssl", "starttls"],
+        "default": "ssl", "required": True,
+    }
+    assert items["port"]["required"] is False
+    assert "993" in items["port"]["placeholder"] and "143" in items["port"]["placeholder"]
+
+    stored = resolve_update(spec, {"allowed_hosts": [
+        {"host": "IMAP.Example.com", "security": "ssl", "port": ""},
+        {"host": "imap.example.com", "security": "starttls", "port": "143"},
+        {"host": "::1", "security": "starttls", "port": ""},
+    ]}, None)
+    assert stored["allowed_hosts"] == [
+        {"host": "imap.example.com", "port": "993", "security": "ssl"},
+        {"host": "imap.example.com", "port": "143", "security": "starttls"},
+        {"host": "::1", "port": "143", "security": "starttls"},
+    ]
+    # The generic entry rules run first (required host, select choices)...
+    with pytest.raises(ValueError, match="IMAP servers, entry 1: Host is required"):
+        resolve_update(spec, {"allowed_hosts": [{"host": "", "security": "ssl"}]}, None)
+    with pytest.raises(ValueError, match="entry 1: Security must be one of: ssl, starttls"):
+        resolve_update(spec, {"allowed_hosts": [{"host": "x", "security": "plain"}]}, None)
+    # ...then the plugin's own validation.
+    with pytest.raises(ValueError, match="Entry 1: Host: no scheme"):
+        resolve_update(spec, {"allowed_hosts": [{"host": "imaps://x", "security": "ssl"}]}, None)
+    with pytest.raises(ValueError, match="Entry 2: duplicate of entry 1"):
+        resolve_update(spec, {"allowed_hosts": [
+            {"host": "x.example", "security": "ssl"},
+            {"host": "x.example", "security": "ssl", "port": "993"},
+        ]}, None)
+    with pytest.raises(ValueError, match="add at least one server"):
+        resolve_update(spec, {"allowed_hosts": []}, None)
+
+
+def test_plugin_post_load_migrates_legacy_text_card(imap_plugin, tmp_path, monkeypatch):
+    """The manifest's post_load hook rewrites a pre-list-field text card
+    into entries, so the card reads configured and the per-user select
+    offers the lines."""
+    from config import service_credentials as sc
+    from config.service_specs import form_view
+    monkeypatch.setattr(sc, "SERVICE_CREDENTIALS_DIR", tmp_path / "service_credentials")
+    sc.write_service_credentials("imap", {"allowed_hosts": "imap.example.com\nmail.example.org:143"})
+    spec = get_service_spec("imap")
+    assert spec.is_configured(sc.read_service_credentials("imap")) is False
+    assert form_view(spec, sc.read_service_credentials("imap")) == {"allowed_hosts": []}
+
+    assert imap_plugin.post_load is not None
+    imap_plugin.post_load()
+    stored = sc.read_service_credentials("imap")
+    assert stored == {"allowed_hosts": [
+        {"host": "imap.example.com", "port": "993", "security": "ssl"},
+        {"host": "mail.example.org", "port": "143", "security": "starttls"},
+    ]}
+    assert spec.is_configured(stored) is True
+    assert form_view(spec, stored) == stored
+    assert imap_field_options_for_test() == ["imap.example.com:993 ssl", "mail.example.org:143 starttls"]
+
+
+def imap_field_options_for_test():
+    from plugins.imap.settings import imap_field_options
+    return imap_field_options()["server"]

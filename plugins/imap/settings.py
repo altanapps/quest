@@ -4,27 +4,42 @@ Stdlib-only (the admin card is read lazily through
 ``config.service_credentials``), so the manifest hooks stay importable
 without the app stack.
 
-Admin card (service ``imap``): one ``allowed_hosts`` textarea ("IMAP
-servers"), one server configuration per line::
-
-    host[:port][ ssl|starttls]
+Admin card (service ``imap``): one ``allowed_hosts`` **list** field
+("IMAP servers") whose entries are small forms -- ``host``, ``port``
+and ``security`` -- added, edited and removed one at a time in the
+Settings UI (the generic ``list`` field type of
+``config.plugin_types.CredentialField``). Each entry describes one
+allowed server configuration:
 
 - ``host``: a DNS name (lower-cased, trailing dot dropped, punycode for
-  non-ASCII), an IPv4 literal, or an IPv6 literal in brackets
-  (``[::1]``). No scheme, path or userinfo.
-- defaults: no port and no mode = ``993 ssl``; ``:143`` without a mode =
-  ``starttls``; any other port without a mode = ``ssl``; ``ssl`` without
-  a port = 993; ``starttls`` without a port = 143.
-- the mode is ``ssl`` (implicit TLS) or ``starttls``, case-insensitive,
-  separated by whitespace; there is no plaintext mode.
-- a host may appear on several lines with different port/mode; two lines
-  naming the same configuration (after the defaults are applied) are an
-  error.
+  non-ASCII), an IPv4 literal, or an IPv6 literal (bare or in brackets,
+  ``::1`` / ``[::1]``). No scheme, path, port or userinfo.
+- ``security``: ``ssl`` (implicit TLS, the form default) or
+  ``starttls``; there is no plaintext mode. An empty value (API
+  callers) means ``starttls`` for port 143, else ``ssl``.
+- ``port``: optional; empty means the mode's default, 993 for ``ssl``
+  and 143 for ``starttls``.
+- the same host may appear in several entries with different port/mode;
+  two entries naming the same configuration (after the defaults are
+  applied) are an error.
 
-Saving the card normalises every line to its canonical form
-``host:port mode`` (``imap.example.com:993 ssl``, ``[::1]:143 starttls``).
+Saving the card stores every entry in canonical form
+(``{"host": "imap.example.com", "port": "993", "security": "ssl"}``,
+IPv6 hosts bare). The canonical LINE form ``host:port mode``
+(``imap.example.com:993 ssl``, ``[::1]:143 starttls``) is what the
+per-user server select offers and what connection rows store.
+
+Cards saved before the list field held the legacy TEXT form instead:
+one ``host[:port][ ssl|starttls]`` line per server (the same defaults;
+additionally ``:143`` without a mode meant ``starttls``). The plugin's
+``post_load`` hook (:func:`migrate_legacy_allowed_hosts`) rewrites such
+a card into entries once at startup (:func:`parse_legacy_server_lines`
+is the text parser, kept for that); text that no longer parses is left
+in place with a warning and reads as an unconfigured card. Nothing else
+reads the text form.
+
 Every connect re-reads the card (:func:`load_allowed_servers`), so
-removing a line takes effect on the next tool call.
+removing an entry takes effect on the next tool call.
 
 Per-user connection rows (``form`` kind) store their form values under
 ``oauth_blob["values"]``: ``server`` (one of the canonical lines, chosen
@@ -71,9 +86,14 @@ class ServerConfig:
     security: str
 
     def line(self) -> str:
-        """The canonical form: ``host:port mode`` (IPv6 bracketed)."""
+        """The canonical line form: ``host:port mode`` (IPv6 bracketed)."""
         host = f"[{self.host}]" if ":" in self.host else self.host
         return f"{host}:{self.port} {self.security}"
+
+    def entry(self) -> dict:
+        """The canonical admin-card entry (the ``list`` field's item
+        values, all strings; IPv6 hosts bare)."""
+        return {"host": self.host, "port": str(self.port), "security": self.security}
 
 
 def _parse_port(text: str) -> int:
@@ -167,49 +187,146 @@ def parse_server_line(line: str) -> ServerConfig:
     return ServerConfig(host, port, security)
 
 
-def parse_allowed_servers(text: Any) -> list[ServerConfig]:
-    """Parse the admin ``allowed_hosts`` text, in admin order.
+def parse_server_entry(entry: Any) -> ServerConfig:
+    """Parse one admin-card entry ``{"host", "port", "security"}`` (defaults
+    applied; values may be missing, empty, or carry surrounding whitespace).
 
-    Blank lines and surrounding whitespace are ignored. Raises
-    ``ValueError("Line N: ...")`` on the first bad line, including a line
-    that names the same configuration as an earlier one.
+    Raises ValueError with a short reason naming the offending field.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError("server entry must be an object")
+    host_text = str(entry.get("host") or "").strip()
+    if not host_text:
+        raise ValueError("Host is required")
+    if ":" in host_text and "://" not in host_text and not host_text.startswith("["):
+        # A bare IPv6 literal (the entry form has a separate port field,
+        # so a colon can only mean IPv6; a host:port spelling is refused
+        # by the port-in-host check below).
+        if host_text.count(":") == 1:
+            raise ValueError("Host: write the port in the Port field")
+        host_text = f"[{host_text}]"
+    try:
+        host, port_in_host = _parse_host_port(host_text)
+    except ValueError as exc:
+        raise ValueError(f"Host: {exc}") from None
+    if port_in_host is not None:
+        raise ValueError("Host: write the port in the Port field")
+    port_text = str(entry.get("port") or "").strip()
+    port: Optional[int] = None
+    if port_text:
+        try:
+            port = _parse_port(port_text)
+        except ValueError as exc:
+            raise ValueError(f"Port: {exc}") from None
+    security_text = str(entry.get("security") or "").strip().lower()
+    security: Optional[str] = security_text or None
+    if security is not None and security not in SECURITY_CHOICES:
+        raise ValueError(
+            f"Security: unknown mode {security_text!r} (use ssl or starttls; "
+            "plaintext IMAP is not supported)"
+        )
+    if security is None:
+        security = "starttls" if port == STARTTLS_DEFAULT_PORT else "ssl"
+    if port is None:
+        port = DEFAULT_PORT_FOR_SECURITY[security]
+    return ServerConfig(host, port, security)
+
+
+def _collect_servers(items, parse, noun: str) -> list[ServerConfig]:
+    """Parse numbered ``(number, raw)`` items with ``parse``, refusing a
+    configuration already seen; errors are prefixed ``"<noun> N: "``."""
+    entries: list[ServerConfig] = []
+    first_seen: dict[ServerConfig, int] = {}
+    for number, raw in items:
+        try:
+            entry = parse(raw)
+        except ValueError as exc:
+            raise ValueError(f"{noun} {number}: {exc}") from None
+        if entry in first_seen:
+            raise ValueError(
+                f"{noun} {number}: duplicate of {noun.lower()} "
+                f"{first_seen[entry]} ({entry.line()})"
+            )
+        first_seen[entry] = number
+        entries.append(entry)
+    return entries
+
+
+def parse_allowed_servers(value: Any) -> list[ServerConfig]:
+    """Parse the admin ``allowed_hosts`` value -- a list of entry dicts
+    (see :func:`parse_server_entry`) -- in admin order; None = [].
+
+    Raises ``ValueError("Entry N: ...")`` on the first bad entry,
+    including one that names the same configuration as an earlier one.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("the server list must be a list of entries")
+    return _collect_servers(enumerate(value, start=1), parse_server_entry, "Entry")
+
+
+def parse_legacy_server_lines(text: Any) -> list[ServerConfig]:
+    """Parse the pre-list-field text form, one ``host[:port][ ssl|starttls]``
+    line per server (blank lines ignored; see :func:`parse_server_line`).
+    Only the startup migration uses it. Raises ``ValueError("Line N: ...")``.
     """
     if text is None:
         return []
     if not isinstance(text, str):
         raise ValueError("the server list must be text")
-    entries: list[ServerConfig] = []
-    first_line: dict[ServerConfig, int] = {}
-    for number, raw in enumerate(text.splitlines(), start=1):
-        if not raw.strip():
-            continue
-        try:
-            entry = parse_server_line(raw)
-        except ValueError as exc:
-            raise ValueError(f"Line {number}: {exc}") from None
-        if entry in first_line:
-            raise ValueError(
-                f"Line {number}: duplicate of line {first_line[entry]} ({entry.line()})"
-            )
-        first_line[entry] = number
-        entries.append(entry)
-    return entries
+    numbered = [
+        (number, raw)
+        for number, raw in enumerate(text.splitlines(), start=1)
+        if raw.strip()
+    ]
+    return _collect_servers(numbered, parse_server_line, "Line")
 
 
 def validate_imap_admin(values: dict) -> dict:
     """``credential_validate`` hook: normalise ``allowed_hosts`` to one
-    canonical ``host:port mode`` line per server, or raise ValueError
-    (shown on the card)."""
-    entries = parse_allowed_servers(values.get("allowed_hosts") or "")
+    canonical entry per server (see :meth:`ServerConfig.entry`), or raise
+    ValueError (shown on the card)."""
+    entries = parse_allowed_servers(values.get("allowed_hosts"))
     if not entries:
-        raise ValueError("IMAP servers: list at least one server.")
-    return {**values, "allowed_hosts": "\n".join(e.line() for e in entries)}
+        raise ValueError("IMAP servers: add at least one server.")
+    return {**values, "allowed_hosts": [e.entry() for e in entries]}
+
+
+def migrate_legacy_allowed_hosts() -> bool:
+    """``post_load`` hook: rewrite a card still holding ``allowed_hosts``
+    as legacy text lines into the list field's entries. Returns whether
+    the store was written. Text that does not parse is left as it is
+    (logged; the card reads as not configured until the admin re-saves
+    it). Runs once per startup; a failure (e.g. the encryption key not
+    yet unlocked on a manual uvicorn start) is logged by the loader."""
+    from config import service_credentials
+
+    config = service_credentials.read_service_credentials(SERVICE_ID)
+    if not isinstance(config, dict) or not isinstance(config.get("allowed_hosts"), str):
+        return False
+    try:
+        entries = parse_legacy_server_lines(config["allowed_hosts"])
+    except ValueError as exc:
+        logger.warning(
+            "IMAP admin server list is in the legacy text form and does not "
+            "parse (%s); re-save it in Settings > Service Credentials", exc,
+        )
+        return False
+    service_credentials.write_service_credentials(
+        SERVICE_ID, {**config, "allowed_hosts": [e.entry() for e in entries]},
+    )
+    logger.info(
+        "Migrated the IMAP admin server list from text lines to %d entr%s",
+        len(entries), "y" if len(entries) == 1 else "ies",
+    )
+    return True
 
 
 def imap_is_configured(config: dict) -> bool:
-    """At least one valid server line (False on any parse error)."""
+    """At least one valid server entry (False on any parse error)."""
     try:
-        return bool(parse_allowed_servers((config or {}).get("allowed_hosts") or ""))
+        return bool(parse_allowed_servers((config or {}).get("allowed_hosts")))
     except (ValueError, AttributeError):
         return False
 
@@ -222,7 +339,7 @@ def load_allowed_servers() -> list[ServerConfig]:
     if not isinstance(config, dict):
         return []
     try:
-        return parse_allowed_servers(config.get("allowed_hosts") or "")
+        return parse_allowed_servers(config.get("allowed_hosts"))
     except ValueError as exc:
         logger.warning("IMAP admin server list is invalid: %s", exc)
         return []
