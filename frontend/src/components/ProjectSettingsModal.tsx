@@ -22,6 +22,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { ProjectSkillsSection } from './ProjectSkillsSection';
 import { ProjectDocSourcesSection } from './ProjectDocSourcesSection';
+import { MemoriesSection } from './settings/MemoriesSection';
 import { ModalShell } from './ModalShell';
 import './ProjectSettingsModal.css';
 
@@ -33,7 +34,7 @@ interface ProjectSettingsModalProps {
   onProjectDeleted: () => void;
 }
 
-type ProjectSettingsSection = 'general' | 'skills' | 'docs' | 'danger-zone';
+type ProjectSettingsSection = 'general' | 'memories' | 'skills' | 'docs' | 'danger-zone';
 
 interface SectionEntry {
   id: ProjectSettingsSection;
@@ -42,6 +43,7 @@ interface SectionEntry {
 
 const MAIN_SECTIONS: SectionEntry[] = [
   { id: 'general', label: 'General' },
+  { id: 'memories', label: 'Memories' },
   { id: 'skills', label: 'Skills' },
   { id: 'docs', label: 'Docs Access' },
 ];
@@ -278,6 +280,9 @@ export function ProjectSettingsModal({
             </div>
           </>
         );
+
+      case 'memories':
+        return projectId ? <MemoriesSection projectId={projectId} /> : null;
 
       case 'skills':
         return projectId ? <ProjectSkillsSection projectId={projectId} /> : null;
