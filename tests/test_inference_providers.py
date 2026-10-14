@@ -19,6 +19,7 @@ import asyncio
 import json
 import os
 import stat
+from datetime import datetime
 
 import pytest
 from fastapi import HTTPException
@@ -300,6 +301,75 @@ def test_instance_model_pricing_lookup(store):
     }
     assert ip.instance_model_pricing(QWEN) is None
     assert ip.instance_model_pricing("unknown/x") is None
+
+
+def test_upsert_keeps_retired_pricing_snapshots(store):
+    first = {"prompt": 0.1, "completion": 0.2, "cache_read": 0.01}
+    second = {"prompt": 0.3, "completion": 0.6}
+    third = {"prompt": 0.5, "completion": 1.0}
+    ip.upsert_instance(_instance("openrouter", models=[
+        {"id": DEEPSEEK, "pricing": first}, {"id": QWEN},
+    ]))
+    changed_at = datetime(2026, 7, 1, 12, 0)
+    ip.upsert_instance(_instance("openrouter", models=[
+        {"id": DEEPSEEK, "pricing": second}, {"id": QWEN, "pricing": first},
+    ]), now=changed_at)
+    stored = {m["id"]: m for m in ip.get_instance("openrouter")["models"]}
+    assert stored[DEEPSEEK]["pricing"] == second
+    assert stored[DEEPSEEK]["pricing_history"] == [{"until": "2026-07-01T12:00:00", **first}]
+    # A model that had no pricing before retires nothing.
+    assert "pricing_history" not in stored[QWEN]
+
+    # An unchanged price on a later save adds nothing; the history survives
+    # a caller that does not pass it back.
+    ip.upsert_instance(_instance("openrouter", models=[
+        {"id": DEEPSEEK, "pricing": second}, {"id": QWEN, "pricing": first},
+    ]))
+    stored = {m["id"]: m for m in ip.get_instance("openrouter")["models"]}
+    assert stored[DEEPSEEK]["pricing_history"] == [{"until": "2026-07-01T12:00:00", **first}]
+
+    assert ip.instance_model_pricing(DEEPSEEK) == second
+    assert ip.instance_model_pricing(DEEPSEEK, at=datetime(2026, 6, 30)) == first
+    # ``until`` is exclusive: the new price applies from the change itself.
+    assert ip.instance_model_pricing(DEEPSEEK, at=changed_at) == second
+    # Before any recorded history the oldest known snapshot is the best guess.
+    assert ip.instance_model_pricing(DEEPSEEK, at=datetime(2020, 1, 1)) == first
+    assert ip.instance_pricing_period_starts() == {DEEPSEEK: [changed_at]}
+
+    later = datetime(2026, 8, 1)
+    ip.upsert_instance(_instance("openrouter", models=[
+        {"id": DEEPSEEK, "pricing": third}, {"id": QWEN, "pricing": first},
+    ]), now=later)
+    assert ip.instance_model_pricing(DEEPSEEK, at=datetime(2026, 7, 15)) == second
+    assert ip.instance_model_pricing(DEEPSEEK, at=later) == third
+    assert ip.instance_pricing_period_starts() == {DEEPSEEK: [changed_at, later]}
+
+    from db.llm_pricing import estimate_cost_usd
+    metrics = {"prompt_tokens": 1_000_000}
+    assert estimate_cost_usd(
+        "openrouter", f"openrouter:{DEEPSEEK}", metrics, at=datetime(2026, 6, 1),
+    ) == pytest.approx(0.1)
+    assert estimate_cost_usd("openrouter", DEEPSEEK, metrics) == pytest.approx(0.5)
+
+
+def test_pricing_history_normalization_drops_malformed_entries(store):
+    ip.upsert_instance(_instance("openrouter", models=[{
+        "id": DEEPSEEK,
+        "pricing": {"prompt": 2.0, "completion": 3.0},
+        "pricing_history": [
+            {"until": "2026-02-01T00:00:00", "prompt": 1, "completion": 2},
+            {"until": "not a date", "prompt": 1, "completion": 2},
+            {"until": "2026-01-15T00:00:00", "prompt": 1},  # no completion rate
+            "junk",
+            # tz-aware stamps are stored as naive UTC; sorted ascending
+            {"until": "2026-01-01T00:00:00+00:00", "prompt": 0.5, "completion": 0.7},
+        ],
+    }]))
+    history = ip.get_instance("openrouter")["models"][0]["pricing_history"]
+    assert history == [
+        {"until": "2026-01-01T00:00:00", "prompt": 0.5, "completion": 0.7},
+        {"until": "2026-02-01T00:00:00", "prompt": 1.0, "completion": 2.0},
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -886,9 +956,12 @@ def test_admin_update_instance_models_snapshot_from_catalog(
     assert stored[DEEPSEEK]["max_completion_tokens"] == 384_000
     assert stored[DEEPSEEK]["pricing"] == {"prompt": 0.15, "completion": 0.6, "cache_read": 0.003}
     # Existing model: its stored snapshot is kept (only the flag changes)
+    # except the price, which is re-read from the cached catalog
     assert stored[QWEN]["name"] == "kept as-is"
     assert stored[QWEN]["context_length"] == 5
     assert stored[QWEN]["enabled"] is False
+    assert stored[QWEN]["pricing"] == {"prompt": 0.45, "completion": 3.2}
+    assert "pricing_history" not in stored[QWEN]
     # Custom id the catalog does not list: defaults
     assert stored["custom/model"]["name"] == "custom/model"
     assert stored["custom/model"]["pricing"] is None
@@ -897,6 +970,38 @@ def test_admin_update_instance_models_snapshot_from_catalog(
     assert health_store.get(f"openrouter:{QWEN}")["ok"] is True
     # Only enabled + credentialed models are rechecked
     assert scheduled == [[f"openrouter:{DEEPSEEK}", "openrouter:custom/model"]]
+
+
+def test_admin_update_instance_refreshes_existing_pricing_with_history(
+    admin_routes, scheduled, fake_catalog, health_store,
+):
+    ip.upsert_instance(_instance("openrouter", models=[
+        {"id": DEEPSEEK, "name": "mine", "pricing": {"prompt": 0.1, "completion": 0.2}},
+        {"id": "custom/model", "pricing": {"prompt": 9.0, "completion": 9.0}},
+    ]))
+    ip.write_inference_credentials("openrouter", {"api_key": "sk-or"})
+
+    body = admin_routes.InstanceUpdate(models=[
+        admin_routes.InstanceModelUpdate(id=DEEPSEEK),
+        admin_routes.InstanceModelUpdate(id="custom/model"),
+    ])
+    _run(admin_routes.admin_update_inference_instance("openrouter", body, user=ADMIN_USER))
+    stored = {m["id"]: m for m in ip.get_instance("openrouter")["models"]}
+    # Catalog-listed model: price refreshed, the old one retired with a stamp,
+    # everything else of the snapshot untouched.
+    assert stored[DEEPSEEK]["pricing"] == {"prompt": 0.15, "completion": 0.6, "cache_read": 0.003}
+    assert stored[DEEPSEEK]["name"] == "mine"
+    (retired,) = stored[DEEPSEEK]["pricing_history"]
+    assert {k: v for k, v in retired.items() if k != "until"} == {"prompt": 0.1, "completion": 0.2}
+    datetime.fromisoformat(retired["until"])
+    # Unlisted custom id: keeps whatever price it had.
+    assert stored["custom/model"]["pricing"] == {"prompt": 9.0, "completion": 9.0}
+    assert "pricing_history" not in stored["custom/model"]
+
+    # Saving again with the catalog unchanged retires nothing more.
+    _run(admin_routes.admin_update_inference_instance("openrouter", body, user=ADMIN_USER))
+    stored = {m["id"]: m for m in ip.get_instance("openrouter")["models"]}
+    assert len(stored[DEEPSEEK]["pricing_history"]) == 1
 
 
 def test_admin_update_instance_new_models_start_private_disallowed(

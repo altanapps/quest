@@ -528,6 +528,70 @@ def test_usage_by_model_empty_window(_isolated_db):
     assert _run(store.get_usage_by_model()) == []
 
 
+def test_pricing_periods_price_each_call_at_the_rate_in_force(_isolated_db, monkeypatch):
+    """A dated rate change prices calls before it at the old rate and calls
+    from it on at the new one, inside one merged per-model entry."""
+    store, models_mod = _isolated_db
+    import db.llm_pricing as pricing
+    monkeypatch.setitem(pricing._ANTHROPIC_PRICING, "claude-opus-4-8", [
+        {"input": 5.00, "output": 25.00},
+        {"effective_from": "2026-06-01", "input": 10.00, "output": 50.00},
+    ])
+    conv = str(uuid.uuid4())
+    before = _record_anthropic(store, models_mod, conv, output_tokens=0, input_tokens=1_000_000)
+    _set_created_at(store, models_mod.LlmCallAnthropic, before["id"],
+                    datetime(2026, 5, 31, 23, 59, 59))
+    at_change = _record_anthropic(store, models_mod, conv, output_tokens=0, input_tokens=1_000_000)
+    _set_created_at(store, models_mod.LlmCallAnthropic, at_change["id"], datetime(2026, 6, 1))
+    after = _record_anthropic(store, models_mod, conv, output_tokens=0, input_tokens=1_000_000)
+    _set_created_at(store, models_mod.LlmCallAnthropic, after["id"], datetime(2026, 9, 1))
+
+    usage = _run(store.get_usage_by_model_for_conversations([conv]))[conv]
+    (entry,) = usage["models"]
+    assert entry["call_count"] == 3
+    assert entry["metrics"]["input_tokens"] == 3_000_000
+    assert entry["estimated_cost_usd"] == pytest.approx(5.0 + 10.0 + 10.0)
+    assert entry["cost_source"] == "estimated"
+    assert usage["total"]["estimated_cost_usd"] == pytest.approx(25.0)
+
+
+def test_pricing_periods_follow_retired_instance_snapshots(_isolated_db):
+    """A refreshed instance pricing snapshot prices the calls made before
+    the refresh at the retired snapshot, whether the rows carry the
+    qualified or the bare wire id."""
+    store, models_mod = _isolated_db
+    import config.inference_providers as ip
+    wire_id = "vendor/repriced"
+    instance = {"id": "openrouter", "kind": "openrouter", "label": "x", "models": [
+        {"id": wire_id, "pricing": {"prompt": 1.0, "completion": 2.0}},
+    ]}
+    ip.upsert_instance(instance)
+    instance["models"][0]["pricing"] = {"prompt": 3.0, "completion": 4.0}
+    ip.upsert_instance(instance, now=datetime(2026, 7, 1))
+
+    conv = str(uuid.uuid4())
+
+    def _call(model, created):
+        row = _run(store.record_api_call(
+            conversation_id=conv, user_id=1, model=model,
+            call_type=models_mod.ApiCallType.TOP_LEVEL,
+            input_tokens=1_000_000, output_tokens=0, duration_ms=1,
+            provider="openrouter",
+            raw_usage={"prompt_tokens": 1_000_000, "completion_tokens": 0},
+        ))
+        _set_created_at(store, models_mod.LlmCallOpenRouter, row["id"], created)
+
+    _call(f"openrouter:{wire_id}", datetime(2026, 6, 30))
+    _call(wire_id, datetime(2026, 6, 30))  # bare legacy id
+    _call(f"openrouter:{wire_id}", datetime(2026, 7, 2))
+
+    usage = _run(store.get_usage_by_model_for_conversations([conv]))[conv]
+    by_model = {m["model"]: m for m in usage["models"]}
+    assert by_model[f"openrouter:{wire_id}"]["estimated_cost_usd"] == pytest.approx(1.0 + 3.0)
+    assert by_model[wire_id]["estimated_cost_usd"] == pytest.approx(1.0)
+    assert usage["total"]["estimated_cost_usd"] == pytest.approx(5.0)
+
+
 def test_collect_usage_buckets_default_key_unchanged(_isolated_db):
     """Without ``by_call_type`` the bucket key stays (conversation, model)
     and entries carry no call_type -- the existing callers' contract."""

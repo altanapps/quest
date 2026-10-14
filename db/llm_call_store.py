@@ -19,13 +19,14 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Select, case, func, literal, select
+from sqlalchemy import Select, and_, case, func, literal, or_, select
 
 from db.engine import AsyncSessionLocal
 from db.llm_pricing import (
     LONG_CONTEXT_THRESHOLD,
     estimate_cost_usd,
     long_context_threshold_overrides,
+    pricing_period_starts,
 )
 from db.models import (
     ApiCallType,
@@ -1039,8 +1040,11 @@ async def _collect_usage_buckets(
     materialised into a bind-parameter list), and/or a ``created_at``
     window (cost analysis), one grouped query per provider table either
     way. The query splits each (conversation, model) into (at most) a
-    normal- and a long-context bucket so tier pricing is exact; the
-    buckets merge back into one entry per key.
+    normal- and a long-context bucket so tier pricing is exact, and into
+    one bucket per pricing period (``pricing_period_starts()``: the
+    moments the model's rates changed) so every estimated bucket is priced
+    at the rate set in force when its calls were made; the buckets merge
+    back into one entry per key.
 
     ``by_call_type`` additionally splits the buckets on the rows'
     ``call_type`` (top-level vs sub-agent), for callers that need to tell
@@ -1079,6 +1083,7 @@ async def _collect_usage_buckets(
                 if overrides else LONG_CONTEXT_THRESHOLD
             )
             long_context = case((context_size > threshold, 1), else_=0)
+            pricing_period = _pricing_period_column(row_cls, provider)
             if cost_spec is not None:
                 # Rows carrying a provider-reported amount are bucketed
                 # apart from the ones that must be estimated, so a mixed
@@ -1094,6 +1099,10 @@ async def _collect_usage_buckets(
             group_cols = [
                 row_cls.conversation_id, row_cls.model, long_context, has_reported,
             ]
+            if pricing_period is not None:
+                group_cols.append(pricing_period)
+            else:
+                pricing_period = literal("")
             if by_call_type:
                 group_cols.append(row_cls.call_type)
                 call_type_col = row_cls.call_type
@@ -1112,6 +1121,7 @@ async def _collect_usage_buckets(
                     row_cls.model,
                     long_context,
                     has_reported,
+                    pricing_period,
                     call_type_col,
                     day_col,
                     func.count(row_cls.id),
@@ -1138,7 +1148,7 @@ async def _collect_usage_buckets(
                 stmt = stmt.where(row_cls.created_at < end)
             result = await db.execute(stmt)
             for (
-                conv_id, model, is_long, is_reported, call_type, day,
+                conv_id, model, is_long, is_reported, period, call_type, day,
                 call_count, user_id, reported, *sums
             ) in result.all():
                 metrics = {
@@ -1151,7 +1161,8 @@ async def _collect_usage_buckets(
                     source: Optional[str] = COST_SOURCE_REPORTED
                 else:
                     cost = estimate_cost_usd(
-                        provider, model, metrics, long_context=bool(is_long)
+                        provider, model, metrics, long_context=bool(is_long),
+                        at=datetime.fromisoformat(period) if period else datetime.min,
                     )
                     source = COST_SOURCE_ESTIMATED if cost is not None else None
                 user_ids[conv_id] = int(user_id)
@@ -1183,6 +1194,36 @@ async def _collect_usage_buckets(
                     entry["metrics"][field] += metrics[field]
                 add_cost(entry, "estimated_cost_usd", "cost_source", cost, source)
     return by_key, user_ids
+
+
+def _pricing_period_column(row_cls, provider: str):
+    """Per-row pricing period of a ``provider`` table, for the GROUP BY.
+
+    The ISO timestamp of the latest rate change at or before the row's
+    ``created_at`` for a model whose rates changed over time
+    (``pricing_period_starts()``), else ``''`` -- the open-ended first
+    period, which ``estimate_cost_usd(at=datetime.min)`` selects. None when
+    no model of the provider has a dated price (nothing to group on). The
+    model is matched on the full id for the Vertex tables and on the wire
+    id -- bare or behind an ``<instance>:`` qualifier -- for the shared
+    ``llm_calls_openrouter`` table.
+    """
+    whens = []
+    for model_key, starts in pricing_period_starts(provider).items():
+        if provider == "openrouter":
+            suffix = ":" + model_key
+            matches = or_(
+                row_cls.model == model_key,
+                func.substr(row_cls.model, -len(suffix)) == suffix,
+            )
+        else:
+            matches = row_cls.model == model_key
+        # Latest boundary first: the first true WHEN wins.
+        for start in reversed(starts):
+            whens.append((and_(matches, row_cls.created_at >= start), start.isoformat()))
+    if not whens:
+        return None
+    return case(*whens, else_="")
 
 
 def _group_buckets_by_conversation(

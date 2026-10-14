@@ -1,5 +1,7 @@
 """Tests for the static price table in db/llm_pricing.py."""
 
+from datetime import datetime, timezone
+
 import pytest
 
 from chat.llm.config import MODEL_REGISTRY
@@ -12,6 +14,7 @@ from db.llm_pricing import (
     estimate_cost_usd,
     long_context_threshold,
     long_context_threshold_overrides,
+    pricing_period_starts,
 )
 
 
@@ -171,9 +174,115 @@ def test_instance_snapshot_pricing_wins_over_the_static_tables(monkeypatch):
 
     monkeypatch.setattr(
         ip, "instance_model_pricing",
-        lambda wire_id: {"prompt": 1.0, "completion": 2.0} if wire_id.endswith("kimi-k3") else None,
+        lambda wire_id, at=None: {"prompt": 1.0, "completion": 2.0} if wire_id.endswith("kimi-k3") else None,
     )
     # $1 x 1M uncached + $1 x 1M cached (no cache_read -> input rate) + $2 x 1M
     assert estimate_cost_usd(
         "openrouter", "fireworks:accounts/fireworks/models/kimi-k3", _FIREWORKS_METRICS,
     ) == pytest.approx(4.0)
+
+
+# ---------------------------------------------------------------------------
+# Date-ranged rate sets
+# ---------------------------------------------------------------------------
+
+_DATED_ENTRY = [
+    {
+        "input": 1.00, "output": 4.00,
+        "long_context_threshold": 100_000,
+        "long_context": {"input": 2.00, "output": 8.00},
+    },
+    {
+        "effective_from": "2026-01-01",
+        "input": 1.50, "output": 6.00,
+        "long_context_threshold": 100_000,
+        "long_context": {"input": 3.00, "output": 12.00},
+    },
+]
+
+
+def test_tables_are_well_formed():
+    """Every entry is one rate set or a dated list: later sets carry an
+    ascending ``effective_from``, every set has input + output rates, and a
+    model's long-context threshold never changes between its sets (the
+    tier flag is computed per model)."""
+    for table in (_GEMINI_PRICING, _ANTHROPIC_PRICING, _OPENROUTER_PRICING, _FIREWORKS_PRICING):
+        for model, entry in table.items():
+            sets = entry if isinstance(entry, list) else [entry]
+            assert sets, model
+            starts = [rate_set.get("effective_from") for rate_set in sets[1:]]
+            assert all(isinstance(start, str) for start in starts), model
+            parsed = [datetime.fromisoformat(start) for start in starts]
+            assert parsed == sorted(parsed), model
+            assert len({rate_set.get("long_context_threshold") for rate_set in sets}) == 1, model
+            for rate_set in sets:
+                assert {"input", "output"} <= set(rate_set), model
+
+
+def test_single_rate_set_entries_are_one_open_ended_period():
+    metrics = {"input_tokens": 1_000_000}
+    for at in (None, datetime.min, datetime(2020, 1, 1), datetime(2030, 1, 1)):
+        assert estimate_cost_usd("anthropic", "claude-opus-5", metrics, at=at) == pytest.approx(5.0)
+
+
+def test_date_ranged_entry_prices_each_period_at_its_own_rates(monkeypatch):
+    monkeypatch.setitem(_ANTHROPIC_PRICING, "claude-test", _DATED_ENTRY)
+    metrics = {"input_tokens": 1_000_000}
+    cost = lambda **kw: estimate_cost_usd("anthropic", "claude-test", metrics, **kw)
+
+    # The last moment of the first period, the first of the second.
+    assert cost(at=datetime(2025, 12, 31, 23, 59, 59)) == pytest.approx(1.0)
+    assert cost(at=datetime(2026, 1, 1)) == pytest.approx(1.5)
+    # datetime.min always selects the open-ended first set; None = today.
+    assert cost(at=datetime.min) == pytest.approx(1.0)
+    assert cost() == pytest.approx(1.5)
+    # A tz-aware moment is compared as UTC.
+    assert cost(at=datetime(2025, 12, 31, 23, 59, tzinfo=timezone.utc)) == pytest.approx(1.0)
+    # The long-context tier lives inside each rate set.
+    assert cost(long_context=True, at=datetime(2025, 6, 1)) == pytest.approx(2.0)
+    assert cost(long_context=True, at=datetime(2026, 6, 1)) == pytest.approx(3.0)
+    # The threshold is read from the first set.
+    assert long_context_threshold("anthropic", "claude-test") == 100_000
+    assert long_context_threshold_overrides("anthropic")["claude-test"] == 100_000
+    assert pricing_period_starts("anthropic") == {"claude-test": [datetime(2026, 1, 1)]}
+
+
+def test_openrouter_periods_merge_static_dates_and_retired_snapshots(monkeypatch):
+    import config.inference_providers as ip
+
+    monkeypatch.setitem(_OPENROUTER_PRICING, "vendor/dated", [
+        {"input": 1.0, "output": 2.0},
+        {"effective_from": "2026-03-01", "input": 2.0, "output": 4.0},
+    ])
+    monkeypatch.setattr(ip, "instance_model_pricing", lambda wire_id, at=None: None)
+    monkeypatch.setattr(ip, "instance_pricing_period_starts", lambda: {
+        "vendor/snap": [datetime(2026, 5, 1)],
+        "vendor/dated": [datetime(2026, 9, 1)],
+    })
+    metrics = {"prompt_tokens": 1_000_000}
+    assert estimate_cost_usd(
+        "openrouter", "openrouter:vendor/dated", metrics, at=datetime(2026, 2, 28),
+    ) == pytest.approx(1.0)
+    assert estimate_cost_usd(
+        "openrouter", "openrouter:vendor/dated", metrics, at=datetime(2026, 3, 1),
+    ) == pytest.approx(2.0)
+    assert pricing_period_starts("openrouter") == {
+        "vendor/snap": [datetime(2026, 5, 1)],
+        "vendor/dated": [datetime(2026, 3, 1), datetime(2026, 9, 1)],
+    }
+
+
+def test_retired_instance_snapshot_prices_calls_made_under_it(monkeypatch):
+    import config.inference_providers as ip
+
+    def snapshot_at(wire_id, at=None):
+        if at is not None and at < datetime(2026, 5, 1):
+            return {"prompt": 1.0, "completion": 1.0}
+        return {"prompt": 2.0, "completion": 2.0}
+
+    monkeypatch.setattr(ip, "instance_model_pricing", snapshot_at)
+    metrics = {"prompt_tokens": 1_000_000}
+    assert estimate_cost_usd(
+        "openrouter", "x:vendor/snap", metrics, at=datetime(2026, 4, 30),
+    ) == pytest.approx(1.0)
+    assert estimate_cost_usd("openrouter", "x:vendor/snap", metrics) == pytest.approx(2.0)

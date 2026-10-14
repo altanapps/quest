@@ -38,9 +38,36 @@ with ``long_context_threshold`` (Claude Haiku 5.5: 100K). Resolve it with
 :func:`long_context_threshold`; the grouped read query in
 ``db/llm_call_store.py`` builds its per-call tier flag from
 :func:`long_context_threshold_overrides`.
+
+Price changes: a table entry is either ONE rate set (the dict shape above,
+in force for all time) or a LIST of rate sets ordered by ``effective_from``
+(a ``YYYY-MM-DD`` date, UTC midnight; the first set may omit it and covers
+everything earlier). When a provider changes a price, never edit a rate in
+place -- append a rate set carrying the date the provider announced, so
+calls made before it keep the rate that was actually charged::
+
+    "vendor/model": [
+        {"input": 1.00, "output": 4.00},                                 # until 2026-11-30
+        {"effective_from": "2026-12-01", "input": 1.50, "output": 6.00},  # from then on
+    ],
+
+:func:`estimate_cost_usd` picks the rate set in force at ``at`` (the
+call's ``created_at``; ``None`` = today's rates), and the grouped read
+query groups rows by pricing period via :func:`pricing_period_starts` so
+every bucket it prices is single-rate. ``long_context_threshold`` and the
+``long_context`` tier belong to the rate set, but the threshold itself
+must be the same in every set of a model (the tier flag is computed per
+model, not per period) -- :func:`long_context_threshold` reads the first
+set. Instance pricing snapshots keep their retired rates the same way
+(``pricing_history`` in config/inference_providers.py).
 """
 
+from datetime import date, datetime, timezone
 from typing import Optional
+
+# A ``YYYY-MM-DD`` effective_from parses to this time of day: UTC midnight,
+# comparable with the naive-UTC ``created_at`` of the llm_calls_* rows.
+_BASE_PERIOD = datetime.min
 
 # Default per-call context size above which a model's ``long_context`` rates
 # apply (an entry's ``long_context_threshold`` overrides it).
@@ -177,23 +204,79 @@ _FIREWORKS_PRICING: dict[str, dict] = {
 }
 
 
-def _openrouter_entry(model: str) -> Optional[dict]:
-    """Pricing entry for a row of the shared ``llm_calls_openrouter`` table
-    (every OpenAI-compatible instance kind): the instance snapshot, then the
-    static OpenRouter table, then the static Fireworks table -- the wire-id
-    namespaces (``vendor/model`` vs ``accounts/fireworks/...``) never
-    collide. ``model`` may be qualified (``openrouter:vendor/x``,
+def _naive_utc(moment: datetime) -> datetime:
+    """``moment`` as naive UTC (the llm_calls_* ``created_at`` convention)."""
+    if moment.tzinfo is None:
+        return moment
+    return moment.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def utc_now() -> datetime:
+    """Current time as naive UTC, comparable with ``effective_from`` dates
+    and the ``until`` stamps of retired instance snapshots."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _rate_sets(entry) -> list[dict]:
+    """An entry's rate sets, oldest first (a single dict is one open-ended set)."""
+    return list(entry) if isinstance(entry, list) else [entry]
+
+
+def effective_from(rate_set: dict) -> Optional[datetime]:
+    """When ``rate_set`` starts applying (naive UTC), None for an open-ended first set."""
+    raw = rate_set.get("effective_from")
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return _naive_utc(raw)
+    if isinstance(raw, date):
+        return datetime(raw.year, raw.month, raw.day)
+    return _naive_utc(datetime.fromisoformat(raw))
+
+
+def _period_starts(entry) -> list[datetime]:
+    """The dated boundaries of a multi-period entry, ascending (empty for one set)."""
+    return sorted(
+        start for start in (effective_from(rate_set) for rate_set in _rate_sets(entry)[1:])
+        if start is not None
+    )
+
+
+def rate_set_at(entry, at: Optional[datetime]) -> dict:
+    """The rate set of ``entry`` in force at ``at`` (None = now).
+
+    The latest set whose ``effective_from`` is at or before ``at``; the
+    first set when none is (``datetime.min`` therefore always selects it).
+    """
+    sets = _rate_sets(entry)
+    moment = utc_now() if at is None else _naive_utc(at)
+    chosen = sets[0]
+    for rate_set in sets[1:]:
+        start = effective_from(rate_set)
+        if start is not None and start <= moment:
+            chosen = rate_set
+    return chosen
+
+
+def _openrouter_entry(model: str, at: Optional[datetime] = None) -> Optional[dict]:
+    """Rate set in force at ``at`` for a row of the shared
+    ``llm_calls_openrouter`` table (every OpenAI-compatible instance kind):
+    the instance snapshot (or the retired snapshot that covered ``at``),
+    then the static OpenRouter table, then the static Fireworks table --
+    the wire-id namespaces (``vendor/model`` vs ``accounts/fireworks/...``)
+    never collide. ``model`` may be qualified (``openrouter:vendor/x``,
     ``fireworks:accounts/fireworks/models/x``) or a bare legacy id."""
     from config.inference_providers import instance_model_pricing, split_model_id
 
     wire_id = split_model_id(model)[1]
-    snapshot = instance_model_pricing(wire_id)
+    snapshot = instance_model_pricing(wire_id, at=at)
     if snapshot is not None:
         entry = {"input": snapshot["prompt"], "output": snapshot["completion"]}
         if "cache_read" in snapshot:
             entry["cache_read"] = snapshot["cache_read"]
         return entry
-    return _OPENROUTER_PRICING.get(wire_id) or _FIREWORKS_PRICING.get(wire_id)
+    static = _OPENROUTER_PRICING.get(wire_id) or _FIREWORKS_PRICING.get(wire_id)
+    return rate_set_at(static, at) if static is not None else None
 
 
 _STATIC_PRICING: dict[str, dict[str, dict]] = {
@@ -204,23 +287,55 @@ _STATIC_PRICING: dict[str, dict[str, dict]] = {
 
 def long_context_threshold(provider: str, model: str) -> int:
     """Per-call context size above which ``model``'s long-context rates apply."""
-    entry = _STATIC_PRICING.get(provider, {}).get(model) or {}
-    return entry.get("long_context_threshold", LONG_CONTEXT_THRESHOLD)
+    entry = _STATIC_PRICING.get(provider, {}).get(model)
+    if entry is None:
+        return LONG_CONTEXT_THRESHOLD
+    return _rate_sets(entry)[0].get("long_context_threshold", LONG_CONTEXT_THRESHOLD)
 
 
 def long_context_threshold_overrides(provider: str) -> dict[str, int]:
     """Models of ``provider`` whose threshold differs from the default."""
+    overrides = {}
+    for model, entry in _STATIC_PRICING.get(provider, {}).items():
+        first = _rate_sets(entry)[0]
+        if "long_context_threshold" in first:
+            overrides[model] = first["long_context_threshold"]
+    return overrides
+
+
+def pricing_period_starts(provider: str) -> dict[str, list[datetime]]:
+    """Models of ``provider`` whose rates changed over time, each with the
+    ascending naive-UTC moments a new rate set took effect.
+
+    For ``"openrouter"`` the keys are wire ids (the ``llm_calls_openrouter``
+    rows carry ``<instance>:<wire_id>`` or a bare legacy id) and the
+    moments come from the static tables plus the retired instance pricing
+    snapshots (``instance_pricing_period_starts()``). The grouped read
+    query turns this into a per-row pricing-period column so no bucket it
+    prices spans a rate change.
+    """
+    if provider == "openrouter":
+        from config.inference_providers import instance_pricing_period_starts
+
+        starts: dict[str, list[datetime]] = {}
+        for table in (_OPENROUTER_PRICING, _FIREWORKS_PRICING):
+            for wire_id, entry in table.items():
+                if _period_starts(entry):
+                    starts[wire_id] = _period_starts(entry)
+        for wire_id, moments in instance_pricing_period_starts().items():
+            starts[wire_id] = sorted(set(starts.get(wire_id, [])) | set(moments))
+        return starts
     return {
-        model: entry["long_context_threshold"]
+        model: _period_starts(entry)
         for model, entry in _STATIC_PRICING.get(provider, {}).items()
-        if "long_context_threshold" in entry
+        if _period_starts(entry)
     }
 
 
-def _rates_for(entry: dict, long_context: bool) -> dict:
-    if long_context and "long_context" in entry:
-        return entry["long_context"]
-    return entry
+def _rates_for(rate_set: dict, long_context: bool) -> dict:
+    if long_context and "long_context" in rate_set:
+        return rate_set["long_context"]
+    return rate_set
 
 
 def estimate_cost_usd(
@@ -228,21 +343,26 @@ def estimate_cost_usd(
     model: str,
     metrics: dict,
     long_context: bool = False,
+    at: Optional[datetime] = None,
 ) -> Optional[float]:
     """Estimate the USD cost of provider-native token counts.
 
     ``metrics`` carries the provider's native usage fields (missing/None
     fields count as 0). The math is linear in every field, so it is valid
     for a single call AND for sums of calls -- as long as all summed calls
-    share the same pricing tier, which is why the read query groups by the
-    per-call long-context flag.
+    share the same pricing tier AND the same pricing period, which is why
+    the read query groups by the per-call long-context flag and by
+    pricing period.
 
     Args:
         provider: "gemini", "anthropic", or "openrouter".
         model: Model id as recorded in the llm_calls_* rows (registry id).
-        metrics: Native usage fields for one call or a same-tier sum.
+        metrics: Native usage fields for one call or a same-tier,
+            same-period sum.
         long_context: Whether these calls exceeded the model's
             :func:`long_context_threshold`.
+        at: When the calls were made (the rows' naive-UTC ``created_at``);
+            picks the rate set in force then. None = today's rates.
 
     Returns:
         Estimated USD cost, or None when the model has no pricing entry
@@ -255,7 +375,7 @@ def estimate_cost_usd(
         entry = _GEMINI_PRICING.get(model)
         if entry is None:
             return None
-        rates = _rates_for(entry, long_context)
+        rates = _rates_for(rate_set_at(entry, at), long_context)
         cached = tokens("cached_content_token_count")
         # prompt_token_count includes the cached portion; bill the remainder
         # (and tool-use prompt tokens) at the input rate.
@@ -272,7 +392,8 @@ def estimate_cost_usd(
         entry = _ANTHROPIC_PRICING.get(model)
         if entry is None:
             return None
-        rates = _rates_for(entry, long_context)
+        rate_set = rate_set_at(entry, at)
+        rates = _rates_for(rate_set, long_context)
         creation = tokens("cache_creation_input_tokens")
         creation_5m = tokens("cache_creation_5m_input_tokens")
         creation_1h = tokens("cache_creation_1h_input_tokens")
@@ -281,7 +402,7 @@ def estimate_cost_usd(
         # unsplit remainder at the cheaper 5m rate (5m is the default TTL).
         unsplit = max(creation - creation_5m - creation_1h, 0)
         in_rate = rates["input"]
-        read_mult = entry.get("cache_read_mult", _ANTHROPIC_CACHE_READ_MULT)
+        read_mult = rate_set.get("cache_read_mult", _ANTHROPIC_CACHE_READ_MULT)
         cost = (
             tokens("input_tokens") * in_rate
             + tokens("cache_read_input_tokens") * in_rate * read_mult
@@ -292,7 +413,7 @@ def estimate_cost_usd(
         return cost / 1_000_000
 
     if provider == "openrouter":
-        entry = _openrouter_entry(model)
+        entry = _openrouter_entry(model, at)
         if entry is None:
             return None
         rates = _rates_for(entry, long_context)
