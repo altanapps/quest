@@ -1421,7 +1421,13 @@ async def admin_update_inference_instance(
     limits, pricing) snapshotted from the cached OpenRouter catalog, the
     cached Fireworks catalog (fetched with the instance's key) or, for a
     self-hosted instance, from what its server reports right now; entries
-    no catalog lists are kept as custom ids with conservative defaults. Per-model ``name`` / ``context_length`` overrides in the
+    no catalog lists are kept as custom ids with conservative defaults.
+    Models already on the instance keep their stored snapshot except for
+    ``pricing``, which is refreshed from the cached catalog when it lists
+    the model with a price (self-hosted instances are not asked -- their
+    pricing is a fixed zero); a changed price retires the old snapshot into
+    the model's ``pricing_history`` (``upsert_instance``) so earlier calls
+    stay priced at it. Per-model ``name`` / ``context_length`` overrides in the
     list replace the stored snapshot values (self-hosted servers publish
     no friendly names, and the Ollama context length is what the provider
     requests per call). A key or endpoint change drops cached SDK clients
@@ -1520,17 +1526,28 @@ async def admin_update_inference_instance(
         existing = {m["id"]: m for m in instance["models"]}
         wanted: list[dict] = []
         seen: set[str] = set()
-        new_wire_ids = [
-            m.id.strip() for m in body.models
-            if m.id.strip() and m.id.strip() not in existing
-        ]
-        snapshots = await _catalog_snapshots(instance, new_wire_ids)
+        requested = [m.id.strip() for m in body.models if m.id.strip()]
+        new_wire_ids = [wire_id for wire_id in requested if wire_id not in existing]
+        # Existing models re-read only their price (the catalog is cached,
+        # so this never costs a network round trip); a self-hosted server
+        # is not probed for models it already lists.
+        refresh_wire_ids = (
+            [wire_id for wire_id in requested if wire_id in existing]
+            if kind["catalog"] != "server" else []
+        )
+        snapshots = await _catalog_snapshots(instance, new_wire_ids + refresh_wire_ids)
         for item in body.models:
             wire_id = item.id.strip()
             if not wire_id or wire_id in seen:
                 continue
             seen.add(wire_id)
-            base = existing.get(wire_id) or {"id": wire_id, **(snapshots.get(wire_id) or {})}
+            if wire_id in existing:
+                base = dict(existing[wire_id])
+                refreshed = (snapshots.get(wire_id) or {}).get("pricing")
+                if refreshed is not None:
+                    base["pricing"] = refreshed
+            else:
+                base = {"id": wire_id, **(snapshots.get(wire_id) or {})}
             entry = {**base, "enabled": item.enabled}
             if item.name is not None and item.name.strip():
                 entry["name"] = item.name.strip()

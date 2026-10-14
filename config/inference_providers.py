@@ -73,6 +73,7 @@ the only non-stdlib touchpoint is a lazy import of ``load_server_config``
 inside ``vertex_environment_status()``.
 """
 
+from datetime import datetime, timezone
 import copy
 import json
 import logging
@@ -495,6 +496,46 @@ def _normalize_pricing(value) -> dict | None:
     return out
 
 
+def _normalize_pricing_history(value) -> list[dict]:
+    """Normalize a model's retired pricing snapshots.
+
+    ``[{"until": <ISO 8601 naive-UTC timestamp>, "prompt", "completion",
+    "cache_read"?}, ...]`` ascending by ``until`` -- each the pricing the
+    model carried until that moment, kept by :func:`upsert_instance` when a
+    save changes the model's ``pricing`` so historical calls keep the rate
+    in force when they were made (``db/llm_pricing.py``). Malformed
+    entries are dropped.
+    """
+    if not isinstance(value, list):
+        return []
+    history: list[dict] = []
+    for item in value:
+        if not isinstance(item, dict) or not isinstance(item.get("until"), str):
+            continue
+        try:
+            until = _parse_until(item["until"])
+        except ValueError:
+            continue
+        pricing = _normalize_pricing(item)
+        if pricing is None:
+            continue
+        history.append({"until": until.isoformat(timespec="seconds"), **pricing})
+    history.sort(key=lambda retired: retired["until"])
+    return history
+
+
+def _parse_until(value: str) -> datetime:
+    """A retired snapshot's ``until`` stamp as naive UTC."""
+    moment = datetime.fromisoformat(value)
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return moment
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 # Where a NEAR AI model runs, as snapshotted from its public catalog:
 # ``enclave`` = NEAR's own hardware-attested TEE fleet (Intel TDX + NVIDIA
 # TEE GPUs), ``proxy`` = relayed to a third-party provider. Informational
@@ -508,7 +549,9 @@ def normalize_instance_model(entry) -> dict | None:
 
     Accepts a bare wire-id string (enabled, no metadata) or the full dict
     shape written by the admin endpoints. Unknown keys are dropped; the
-    optional ``tee`` label is kept only when it is one of :data:`TEE_LABELS`.
+    optional ``tee`` label is kept only when it is one of :data:`TEE_LABELS`,
+    and ``pricing_history`` (retired pricing snapshots, see
+    :func:`_normalize_pricing_history`) only when non-empty.
     """
     if isinstance(entry, str):
         entry = {"id": entry}
@@ -529,6 +572,9 @@ def normalize_instance_model(entry) -> dict | None:
     }
     if entry.get("tee") in TEE_LABELS:
         normalized["tee"] = entry["tee"]
+    history = _normalize_pricing_history(entry.get("pricing_history"))
+    if history:
+        normalized["pricing_history"] = history
     return normalized
 
 
@@ -773,20 +819,46 @@ def new_instance_id(kind: str) -> str:
     return candidate
 
 
-def upsert_instance(instance: dict) -> dict:
-    """Insert or replace one instance entry (by id); returns the stored entry."""
+def upsert_instance(instance: dict, now: datetime | None = None) -> dict:
+    """Insert or replace one instance entry (by id); returns the stored entry.
+
+    A model whose ``pricing`` differs from what the instance stored for the
+    same wire id keeps the old snapshot in its ``pricing_history`` with
+    ``until`` = ``now`` (naive UTC, default the current time), so the
+    calls made under the old rates stay priced at them.
+    """
     normalized = _normalize_instance(instance)
     if normalized is None:
         raise ValueError("Invalid inference provider instance")
     config = load_inference_config()
     for index, existing in enumerate(config["instances"]):
         if existing["id"] == normalized["id"]:
+            _retire_changed_pricing(normalized["models"], existing["models"], now)
             config["instances"][index] = normalized
             break
     else:
         config["instances"].append(normalized)
     save_inference_config(config)
     return normalized
+
+
+def _retire_changed_pricing(
+    models: list[dict], previous: list[dict], now: datetime | None,
+) -> None:
+    """Carry each model's stored ``pricing_history`` over to its new entry
+    (a caller need not pass it back) and append the stored pricing of every
+    model whose new ``pricing`` differs from it, stamped ``until`` = now."""
+    before = {model["id"]: model for model in previous}
+    stamp = (now or _utc_now()).isoformat(timespec="seconds")
+    for model in models:
+        old = before.get(model["id"])
+        if old is None:
+            continue
+        history = list(model.get("pricing_history") or old.get("pricing_history") or [])
+        if old.get("pricing") and old["pricing"] != model["pricing"]:
+            history.append({"until": stamp, **old["pricing"]})
+        if history:
+            model["pricing_history"] = _normalize_pricing_history(history)
 
 
 def delete_instance(instance_id: str) -> bool:
@@ -805,14 +877,37 @@ def delete_instance(instance_id: str) -> bool:
     return existed or removed_file
 
 
-def instance_model_pricing(wire_id: str) -> dict | None:
+def instance_model_pricing(wire_id: str, at: datetime | None = None) -> dict | None:
     """Pricing snapshot ($/1M tokens) for an instance-served wire id, if any
-    configured instance lists it with pricing. Used by db/llm_pricing.py."""
+    configured instance lists it with pricing. Used by db/llm_pricing.py.
+
+    With ``at`` (naive UTC), the snapshot in force then: the oldest retired
+    snapshot whose ``until`` is after ``at``, else the current pricing (which
+    also covers moments before the model had any recorded history).
+    """
     for instance in list_instances():
         for model in instance["models"]:
-            if model["id"] == wire_id and model["pricing"]:
+            if model["id"] != wire_id:
+                continue
+            if at is not None:
+                for retired in model.get("pricing_history") or []:
+                    if _parse_until(retired["until"]) > at:
+                        return {key: value for key, value in retired.items() if key != "until"}
+            if model["pricing"]:
                 return model["pricing"]
     return None
+
+
+def instance_pricing_period_starts() -> dict[str, list[datetime]]:
+    """Wire ids with retired pricing snapshots -> the ascending naive-UTC
+    moments their pricing changed (every ``until`` stamp, across all
+    instances). Feeds ``pricing_period_starts()`` in db/llm_pricing.py."""
+    starts: dict[str, set[datetime]] = {}
+    for instance in list_instances():
+        for model in instance["models"]:
+            for retired in model.get("pricing_history") or []:
+                starts.setdefault(model["id"], set()).add(_parse_until(retired["until"]))
+    return {wire_id: sorted(moments) for wire_id, moments in starts.items()}
 
 
 # ---------------------------------------------------------------------------
