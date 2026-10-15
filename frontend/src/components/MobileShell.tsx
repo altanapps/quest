@@ -15,6 +15,10 @@ import { DocsListView } from './docs/DocsListView'
 import { DocViewer } from './docs/DocViewer'
 import { DocsGateClosed } from './docs/DocsGateClosed'
 import type { DocsRoute } from '../utils/docsRoute'
+import { TablesGateClosed } from './tables/TablesGateClosed'
+import { TableViewer } from './tables/TableViewer'
+import { TablesListView } from './tables/TablesListView'
+import type { TablesRoute } from '../utils/tablesRoute'
 
 interface MobileShellProps {
   activeConversationId: string | null
@@ -26,6 +30,10 @@ interface MobileShellProps {
   docsRoute: DocsRoute | null
   /** Whether the `docs` feature gate is open for the current user. */
   docsEnabled: boolean
+  /** Parsed /tables URL (parseTablesRoute), or null off the tables routes. */
+  tablesRoute: TablesRoute | null
+  /** Whether the `tables` feature gate is open for the current user. */
+  tablesEnabled: boolean
 }
 
 interface ConversationSelectOpts {
@@ -37,8 +45,8 @@ interface ConversationSelectOpts {
  * Sidebar/ChatPanel/RightPanel row when useIsMobile() matches. Same routes,
  * same data layer — only the layout tree differs: a fixed top bar, a slide-in
  * drawer hosting the existing Sidebar, and a single main pane (chat, home
- * composer, requests, or a Quest Docs view). The desktop-only RightPanel is
- * intentionally absent.
+ * composer, requests, or a Quest Docs or Quest Tables view). The
+ * desktop-only RightPanel is intentionally absent.
  */
 export function MobileShell({
   activeConversationId,
@@ -48,6 +56,8 @@ export function MobileShell({
   onProjectIdLoaded,
   docsRoute,
   docsEnabled,
+  tablesRoute,
+  tablesEnabled,
 }: MobileShellProps) {
   const { appName } = useAppConfig()
   const {
@@ -135,6 +145,20 @@ export function MobileShell({
     setWorkspaceOpen(false)
   }, [docsRouteKey])
 
+  // Same for a tables view (All Tables, a project filter, or a table). The
+  // viewer's filter / sort are left out of the key: refining a view is not
+  // arriving at one.
+  const tablesRouteKey = tablesRoute
+    ? tablesRoute.kind === 'list'
+      ? `list:${tablesRoute.projectId ?? ''}`
+      : `viewer:${tablesRoute.tableId}`
+    : null
+  useEffect(() => {
+    if (tablesRouteKey === null) return
+    setDrawerOpen(false)
+    setWorkspaceOpen(false)
+  }, [tablesRouteKey])
+
   const closeOverlays = useCallback(() => {
     setDrawerOpen(false)
     setWorkspaceOpen(false)
@@ -198,9 +222,9 @@ export function MobileShell({
             <span className="mobile-topbar-title-text">{appName}</span>
           )}
         </div>
-        {/* No workspace beside a docs view (desktop hides the RightPanel
-            there too); keep the slot so the title stays put. */}
-        {docsRoute ? (
+        {/* No workspace beside a docs or tables view (desktop hides the
+            RightPanel there too); keep the slot so the title stays put. */}
+        {docsRoute || tablesRoute ? (
           <span className="mobile-topbar-button mobile-topbar-button-end" aria-hidden="true" />
         ) : (
           <button
@@ -227,6 +251,20 @@ export function MobileShell({
               <DocsListView projectId={docsRoute.projectId} />
             ) : (
               <DocViewer docId={docsRoute.docId} />
+            )}
+          </div>
+        ) : tablesRoute ? (
+          <div className="main-content docs-main tables-main">
+            {!tablesEnabled ? (
+              <TablesGateClosed />
+            ) : tablesRoute.kind === 'list' ? (
+              <TablesListView projectId={tablesRoute.projectId} />
+            ) : (
+              <TableViewer
+                tableId={tablesRoute.tableId}
+                filter={tablesRoute.filter}
+                sort={tablesRoute.sort}
+              />
             )}
           </div>
         ) : activeConversationId ? (
