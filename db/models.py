@@ -77,6 +77,9 @@ class ActionRequestType(StrEnum):
     RUN_USER_SUBAGENT = "run_user_subagent"
     SUBAGENT_RETURN = "subagent_return"
     WRITE_DOC = "write_doc"
+    CREATE_TABLE = "create_table"
+    CHANGE_TABLE_SCHEMA = "change_table_schema"
+    WRITE_TABLE_ROWS = "write_table_rows"
 
 
 class ActionRequestStatus(StrEnum):
