@@ -9,6 +9,7 @@ the relevant skill(s) on demand through the existing ``load_skills`` tool.
 """
 
 from chat.docs.constants import DOCS_SERVICE_KEY
+from chat.tables.constants import TABLES_SERVICE_KEY
 from chat.gemini_api.constants import (
     MAX_PARALLEL_TASKS,
     MAX_PARALLEL_TEMPLATE_TASKS,
@@ -35,6 +36,15 @@ def _doc_tool_names() -> frozenset[str]:
     )
 
 
+def _table_tool_names() -> frozenset[str]:
+    """The Quest Tables tools: the registry specs gated on the ``tables``
+    connected-services pseudo-key (``requires_service == TABLES_SERVICE_KEY``)."""
+    return frozenset(
+        name for name, spec in TOOL_CALL_REGISTRY.items()
+        if spec.get("requires_service") == TABLES_SERVICE_KEY
+    )
+
+
 def _doc_write_tool_names() -> frozenset[str]:
     """The Quest Docs write tools (create_doc / edit_doc / append_to_doc /
     add_doc_image): the doc tools flagged ``mutating`` in the registry.
@@ -44,6 +54,16 @@ def _doc_write_tool_names() -> frozenset[str]:
     the access rule (chat/docs/access.py) refuses them anyway.
     """
     return _doc_tool_names() & mutating_tool_call_tools()
+
+
+def _table_write_tool_names() -> frozenset[str]:
+    """The Quest Tables row write tools (insert_rows / update_rows /
+    upsert_rows / delete_rows): the table tools flagged ``mutating``.
+
+    Hidden from the read-only tiers' prompts like the doc write tools; the
+    access rule (chat/tables/access.py) refuses them there anyway.
+    """
+    return _table_tool_names() & mutating_tool_call_tools()
 
 
 # Public-project prompt paragraph shown while Quest Docs is enabled for the
@@ -816,14 +836,16 @@ def get_user_subagent_system_prompt(
 
 """
 
-    # Cross-user subagent runs are read-only for Quest Docs (access rule
-    # run_kind "user_subagent"): the doc reads stay, the writes are hidden.
+    # Cross-user subagent runs are read-only for Quest Docs and Tables
+    # (access rule run_kind "user_subagent"): the reads stay, the writes
+    # are hidden.
     # The run is a standalone conversation in the target's account, so the
     # project-only tools never apply.
     user_subagent_exclude = (
         {"wait_for_handles", "set_conversation_name", "suggest_memory"}
         | PROJECT_ONLY_TOOL_CALL_TOOLS
         | _doc_write_tool_names()
+        | _table_write_tool_names()
     )
     dynamic_tools = _build_dynamic_tools_section(
         exclude=user_subagent_exclude, connected_services=connected_services,
@@ -986,6 +1008,7 @@ def get_public_project_system_prompt(
     project_guide: str = "",
     is_routine: bool = False,
     docs_enabled: bool = False,
+    tables_enabled: bool = False,
     legacy_shared_workspace: bool = False,
     converted_from_standalone: bool = False,
 ) -> str:
@@ -1017,6 +1040,10 @@ def get_public_project_system_prompt(
     "Quest Docs" paragraph is omitted; while True the tools are listed and
     the paragraph follows the Boundaries block (it stands in for the
     ``system:quest_docs`` skill, since this prompt carries no skills).
+
+    ``tables_enabled`` is the same switch for the Quest Tables gate
+    (``config.feature_gates.tables_enabled_for``): while False the table
+    tools are excluded from the Dynamic Tools section.
 
     A public-project conversation is always a project conversation, so the
     "Two file spaces" paragraph (conversation workspace at ``/workspace``,
@@ -1075,6 +1102,8 @@ def get_public_project_system_prompt(
         public_exclude.add("suggest_project_memory")
     if not docs_enabled:
         public_exclude |= _doc_tool_names()
+    if not tables_enabled:
+        public_exclude |= _table_tool_names()
     # No skill tools here, so every offered tool is documented in full.
     dynamic_tools_section = _build_dynamic_tools_section(
         exclude=public_exclude, core_only=False,
@@ -1280,12 +1309,13 @@ def get_sub_agent_system_prompt(
     # Build dynamic tools section excluding top-level-only tools and the
     # project-only tools when not in a project conversation. Sub-agents are
     # read-only for Quest Docs (access rule run_kind "sub_agent": "only the
-    # top-level agent writes docs"), so the doc write tools are hidden too.
+    # top-level agent writes docs"), so the doc and table write tools are
+    # hidden too.
     sub_agent_exclude = {
         "wait_for_handles", "set_conversation_name", "suggest_memory",
         "suggest_project_memory",
     }
-    sub_agent_exclude |= _doc_write_tool_names()
+    sub_agent_exclude |= _doc_write_tool_names() | _table_write_tool_names()
     if has_project:
         sub_agent_exclude |= PROJECT_HIDDEN_WORKSPACE_TOOLS
     else:

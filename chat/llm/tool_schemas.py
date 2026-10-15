@@ -13,6 +13,11 @@ Tool tiers:
 import copy
 
 from chat.docs.constants import DOCS_SERVICE_KEY
+from chat.tables.constants import (
+    TABLE_FILTER_IN_MAX_VALUES,
+    TABLE_WRITE_MAX_ROWS,
+    TABLES_SERVICE_KEY,
+)
 from chat.llm.base import ToolSpec
 from chat.workspace_hints import PROJECT_COPY_FIRST_SENTENCE
 from db.models import ActionRequestType
@@ -145,9 +150,10 @@ _GMAIL_ATTACHMENTS_SCHEMA = {
 # A spec may carry ``"mutating": True``: the tool changes state outside the
 # conversation's own workspace WITHOUT an approval card (Gmail drafts/sends/
 # label changes; plugin self-DM / self-SMS / mailbox tools; the Quest Docs
-# writes create_doc / edit_doc / append_to_doc / add_doc_image, whose
-# approval-gated cases refuse with approval_required instead of opening a
-# card). Everything else is a read or a workspace-local write. The
+# writes create_doc / edit_doc / append_to_doc / add_doc_image and the
+# Quest Tables row writes insert_rows / update_rows / upsert_rows /
+# delete_rows, whose approval-gated cases refuse with approval_required
+# instead of opening a card). Everything else is a read or a workspace-local write. The
 # classification feeds mutating_tool_call_tools(), which one-shot inference
 # API runs (origin="inference_api") are refused at dispatch time -- see
 # INFERENCE_API_TOOLS below. Every new tool must be classified: the roster
@@ -157,6 +163,36 @@ _GMAIL_ATTACHMENTS_SCHEMA = {
 # out of the prompt's Dynamic Tools section unless that connected-services
 # key is truthy (plugin services, and the "docs" pseudo-key that mirrors
 # the per-user Quest Docs feature gate).
+# Shared text of the Quest Tables row write tool descriptions.
+_TABLE_WRITE_RULES = (
+    "Values are validated against the column types (numbers may be sent as "
+    "numbers or strings; enum values must be listed options; required and "
+    f"unique columns are enforced). One call writes at most {TABLE_WRITE_MAX_ROWS} rows as a "
+    "single all-or-nothing change: if any row is invalid nothing is "
+    "written and the error lists every problem as invalid_rows "
+    "problems [{row, column, reason}] (row = index in the list)."
+)
+_TABLE_WRITE_APPROVAL = (
+    "If the result is {\"error\": \"approval_required\", ...} the table "
+    "needs the user's approval (it is shared, or its owner requires "
+    "approval for every change): propose the same write as a "
+    "write_table_rows action request by forwarding the returned "
+    "suggested_request (its request_type and params) unchanged through "
+    "create_action_request. Any other error explains why the table cannot "
+    "be written here."
+)
+
+
+def _table_intent(example: str) -> dict:
+    return {
+        "type": "string",
+        "description": (
+            "A brief, user-friendly summary of your intent "
+            f"(max 50 characters). Example: '{example}'."
+        ),
+    }
+
+
 TOOL_CALL_REGISTRY: dict[str, ToolSpec] = {
     "get_current_time": {
         "name": "get_current_time",
@@ -2026,6 +2062,346 @@ TOOL_CALL_REGISTRY: dict[str, ToolSpec] = {
             "required": ["doc_id", "workspace_path"],
         },
     },
+    # -- Quest Tables (chat/tables/service.py). All carry
+    # requires_service=TABLES_SERVICE_KEY: the "tables" connected-services
+    # pseudo-key mirrors the per-user tables feature gate, so the tools are
+    # left out of prompts while the gate is closed (the handlers also
+    # refuse with tables_disabled before any DB work).
+    "list_tables": {
+        "name": "list_tables",
+        "requires_service": TABLES_SERVICE_KEY,
+        "description": (
+            "List the Quest Tables this conversation can see (typed, "
+            "structured record tables kept inside Quest), newest updated "
+            "first: user tables (scope 'user': the user's own and those "
+            "shared with them; never in a public-project conversation), this "
+            "conversation's project tables (scope 'project'), and in a "
+            "private project the read-only public tables of the public "
+            "projects it was given access to. Returns {tables, count}; each table: id, "
+            "title, description, mode ('private' or 'public'), scope, "
+            "project_id, row_count, column_count, columns (\"Name:type\" "
+            "labels; type is text, number, url, boolean or enum, and a "
+            "multi-choice enum is \"Name:enum[]\"), updated_at, writable, "
+            "write_note and schema_change. writable is 'free' (rows can be "
+            "written directly), 'approval' (row changes need the user's "
+            "approval) or 'denied' (read-only here; write_note says why); "
+            "schema_change is 'approval' or 'denied'. Use get_table for the "
+            "full column definitions and sample rows, query_rows to read rows."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["user", "project", "public", "all"],
+                    "default": "all",
+                    "description": (
+                        "'user' = user tables (own and shared; empty in a "
+                        "public-project conversation), 'project' = this "
+                        "project's tables (empty outside a project), 'public' "
+                        "= public tables readable here (a private project's "
+                        "linked public projects; in a public-project "
+                        "conversation, its own tables), 'all' (default) = "
+                        "everything visible."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 50,
+                    "description": "Maximum number of tables to return (1-200, default 50).",
+                },
+                "intent_message": {
+                    "type": "string",
+                    "description": (
+                        "A brief, user-friendly summary of your intent "
+                        "(max 50 characters). Example: 'List my tables'."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    "get_table": {
+        "name": "get_table",
+        "requires_service": TABLES_SERVICE_KEY,
+        "description": (
+            "Get one Quest Table's full definition: {id, title, description, "
+            "mode, scope, project_id, columns, row_count, schema_version, "
+            "updated_at, writable, write_note, schema_change, schema_note, "
+            "sample_rows}. columns lists every column in order as {name, "
+            "type, required, unique, default, options, multiple, precision, "
+            "description} (options and multiple apply to enum columns, "
+            "precision to number columns). sample_rows holds the first 5 "
+            "rows by _id in the query_rows row shape. Call it before "
+            "querying or writing a table you have not looked at yet."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "table_id": {
+                    "type": "string",
+                    "description": "The table id from list_tables.",
+                },
+                "intent_message": {
+                    "type": "string",
+                    "description": (
+                        "A brief, user-friendly summary of your intent "
+                        "(max 50 characters). Example: 'Inspect inventory table'."
+                    ),
+                },
+            },
+            "required": ["table_id"],
+        },
+    },
+    "query_rows": {
+        "name": "query_rows",
+        "requires_service": TABLES_SERVICE_KEY,
+        "description": (
+            "Read rows of a Quest Table with an optional filter, sort and "
+            "paging. Returns {rows, total, truncated, offset, limit}: each "
+            "row is {_id, _updated_at, <column name>: value}; total is the "
+            "number of rows matching the filter (ignoring paging), so page "
+            "with offset until offset + rows returned reaches total. Number "
+            "values come back as canonical strings (\"12.5\"), booleans as "
+            "true/false, multi-choice enums as lists. A response over about "
+            "100 KB is cut by halving the rows: truncated is true and hint "
+            "names the offset to continue from (or asks for fewer columns). "
+            "count_only: true returns only {total}.\n"
+            "filter is JSON: {\"column\": \"<name>\", \"op\": \"<op>\", "
+            "\"value\": ...} leaves combined with {\"and\": [...]}, "
+            "{\"or\": [...]} and {\"not\": <node>} (depth <= 3, <= 20 "
+            "leaves). Ops: any type eq, ne, in (list), is_null, not_null; "
+            "text and url also contains, starts_with, ends_with "
+            "(case-insensitive); number also lt, lte, gt, gte, between "
+            "([low, high]); single enum eq, ne, in; multi-choice enum "
+            "contains (one option), contains_any, contains_all (lists), "
+            "is_empty; on a multi-choice enum eq / ne compare the whole list "
+            "of options. in, contains_any and contains_all take at most "
+            f"{TABLE_FILTER_IN_MAX_VALUES} values. Values are validated like "
+            "writes, so \"10\" and 10 match the same numbers."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "table_id": {
+                    "type": "string",
+                    "description": "The table id from list_tables.",
+                },
+                "filter": {
+                    "type": "object",
+                    "description": (
+                        "Optional filter tree (see the description), e.g. "
+                        "{\"and\": [{\"column\": \"Status\", \"op\": \"eq\", "
+                        "\"value\": \"Open\"}, {\"column\": \"Price\", \"op\": "
+                        "\"gt\", \"value\": 10}]}."
+                    ),
+                },
+                "sort": {
+                    "type": "array",
+                    "description": (
+                        "Optional sort keys, at most 3: [{\"column\": "
+                        "\"<name>\", \"direction\": \"asc\"|\"desc\"}]; nulls "
+                        "sort last. Default: by _id."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "column": {"type": "string"},
+                            "direction": {"type": "string", "enum": ["asc", "desc"]},
+                        },
+                    },
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "default": 100,
+                    "description": "Rows per page (1-1000, default 100).",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100000,
+                    "default": 0,
+                    "description": "Rows to skip (0-100000, default 0).",
+                },
+                "columns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional column names to return (default: every "
+                        "column); _id and _updated_at are always included."
+                    ),
+                },
+                "count_only": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Return only {total} for the filter, no rows.",
+                },
+                "intent_message": {
+                    "type": "string",
+                    "description": (
+                        "A brief, user-friendly summary of your intent "
+                        "(max 50 characters). Example: 'Find open orders'."
+                    ),
+                },
+            },
+            "required": ["table_id"],
+        },
+    },
+    # Row writes. "mutating": no card when the verdict is free, so
+    # inference API runs refuse them at dispatch and restricted sandbox
+    # leases block them; the access rule denies them in every read-only run
+    # kind. An approval verdict refuses with approval_required and a
+    # write_table_rows suggested_request (chat/tables/write_request.py).
+    "insert_rows": {
+        "name": "insert_rows",
+        "requires_service": TABLES_SERVICE_KEY,
+        "mutating": True,
+        "description": (
+            "Add rows to a Quest Table. Each row is {<column name>: value}; "
+            "omitted columns take their default, null leaves a cell empty. "
+            + _TABLE_WRITE_RULES
+            + " Returns {inserted, row_ids (in input order), change_id, "
+            "row_count, updated_at}. " + _TABLE_WRITE_APPROVAL
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "table_id": {
+                    "type": "string",
+                    "description": "The table id from list_tables.",
+                },
+                "rows": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": (
+                        f"The new rows (1-{TABLE_WRITE_MAX_ROWS}), e.g. "
+                        "[{\"Name\": \"Widget\", "
+                        "\"Price\": 9.5}]."
+                    ),
+                },
+                "intent_message": _table_intent("Add order rows"),
+            },
+            "required": ["table_id", "rows"],
+        },
+    },
+    "update_rows": {
+        "name": "update_rows",
+        "requires_service": TABLES_SERVICE_KEY,
+        "mutating": True,
+        "description": (
+            "Change existing rows of a Quest Table by _id (take the ids from "
+            "query_rows). Each update is {\"_id\": n, <column name>: value, "
+            "...}: only the named columns change and null clears a cell. An "
+            "unknown _id fails the whole call. " + _TABLE_WRITE_RULES
+            + " Returns {updated, row_ids, change_id, row_count, "
+            "updated_at}. " + _TABLE_WRITE_APPROVAL
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "table_id": {
+                    "type": "string",
+                    "description": "The table id from list_tables.",
+                },
+                "updates": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": (
+                        f"Partial patches (1-{TABLE_WRITE_MAX_ROWS}), e.g. "
+                        "[{\"_id\": 4, "
+                        "\"Status\": \"Done\"}]."
+                    ),
+                },
+                "intent_message": _table_intent("Mark orders shipped"),
+            },
+            "required": ["table_id", "updates"],
+        },
+    },
+    "upsert_rows": {
+        "name": "upsert_rows",
+        "requires_service": TABLES_SERVICE_KEY,
+        "mutating": True,
+        "description": (
+            "Insert or update rows of a Quest Table matched on key_column, "
+            "which must be a unique column: a row whose key value already "
+            "exists patches that row (only the given columns change), any "
+            "other row is inserted (defaults apply). Every row needs a key "
+            "value, and the same key twice in one call is an error. "
+            + _TABLE_WRITE_RULES
+            + " Returns {inserted, updated, inserted_ids, updated_ids (in "
+            "input order), row_ids, change_id, row_count, updated_at}. "
+            + _TABLE_WRITE_APPROVAL
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "table_id": {
+                    "type": "string",
+                    "description": "The table id from list_tables.",
+                },
+                "key_column": {
+                    "type": "string",
+                    "description": "Name of the unique column to match rows on.",
+                },
+                "rows": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": (
+                        f"The rows (1-{TABLE_WRITE_MAX_ROWS}), each with a value in key_column, "
+                        "e.g. [{\"SKU\": \"A-1\", \"Price\": 12}]."
+                    ),
+                },
+                "intent_message": _table_intent("Sync price list"),
+            },
+            "required": ["table_id", "key_column", "rows"],
+        },
+    },
+    "delete_rows": {
+        "name": "delete_rows",
+        "requires_service": TABLES_SERVICE_KEY,
+        "mutating": True,
+        "description": (
+            "Delete rows of a Quest Table, either by _id (row_ids) or by a "
+            "query_rows filter -- give exactly one. A filter matching more "
+            f"than {TABLE_WRITE_MAX_ROWS} rows is refused with too_many_rows and the matching "
+            "count: narrow the filter or delete in pages. A filter matching "
+            "nothing deletes nothing (change_id null). The call is one "
+            "change that the user can restore from the table's history. "
+            "Returns {deleted, row_ids, change_id, row_count, updated_at}. "
+            + _TABLE_WRITE_APPROVAL
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "table_id": {
+                    "type": "string",
+                    "description": "The table id from list_tables.",
+                },
+                "row_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": (
+                        f"The _id values to delete (1-{TABLE_WRITE_MAX_ROWS}); "
+                        "every one must exist."
+                    ),
+                },
+                "filter": {
+                    "type": "object",
+                    "description": (
+                        "A query_rows filter tree selecting the rows to "
+                        "delete, e.g. {\"column\": \"Status\", \"op\": \"eq\", "
+                        "\"value\": \"Cancelled\"}."
+                    ),
+                },
+                "intent_message": _table_intent("Remove cancelled orders"),
+            },
+            "required": ["table_id"],
+        },
+    },
 }
 
 
@@ -3155,6 +3531,13 @@ PUBLIC_ROUTINE_TOOLS: list[ToolSpec] = PUBLIC_TOOLS + [_ROUTINE_COMPLETED]
 # is_public=True) hides every private doc from a public conversation --
 # it behaves exactly like a nonexistent id -- and lets it create and write
 # only public docs, which hold sandbox-originated content by construction.
+# The Quest Tables tools are allowed on the same terms: tables are
+# mode-partitioned and resolve_table_access (chat/tables/access.py, with
+# is_public=True) hides every private table from a public conversation
+# (byte-equal to a nonexistent id, never listed); only public tables are
+# readable and writable there. The row writes need no gate beyond that
+# rule: a public table's content comes only from public conversations and
+# the UI (taint invariant), and approval-gated cases are denied there.
 # The project memory tools are allowed: they read and propose only the
 # memories of the conversation's own (public) project, every suggestion
 # waits for the user's accept, and a public project's memories are never
@@ -3186,6 +3569,13 @@ PUBLIC_TOOL_CALL_ALLOWLIST: frozenset[str] = frozenset({
     "edit_doc",
     "append_to_doc",
     "add_doc_image",
+    "list_tables",
+    "get_table",
+    "query_rows",
+    "insert_rows",
+    "update_rows",
+    "upsert_rows",
+    "delete_rows",
 })
 
 
@@ -3248,6 +3638,13 @@ _SKILL_DOCUMENTED_TOOLS: dict[str, str] = {
     "edit_doc": "system:quest_docs",
     "append_to_doc": "system:quest_docs",
     "add_doc_image": "system:quest_docs",
+    "list_tables": "system:tables",
+    "get_table": "system:tables",
+    "query_rows": "system:tables",
+    "insert_rows": "system:tables",
+    "update_rows": "system:tables",
+    "upsert_rows": "system:tables",
+    "delete_rows": "system:tables",
 }
 
 
