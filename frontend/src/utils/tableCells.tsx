@@ -18,16 +18,66 @@
  *   host, the full URL in `title`. A value that does not parse as an
  *   http(s) URL renders as text instead (never an href).
  * - boolean: a checkbox glyph, with "true" / "false" as visually hidden text
- *   for screen readers.
+ *   for screen readers (`tableValueText`, the one boolean vocabulary).
  * - enum: single as one chip, multi as chips; an empty multi list is null.
  * - null: a muted italic "NULL", as in TableViewerModal.
  */
 
 import { Square, SquareCheck } from 'lucide-react';
-import type { TableCellValue, TableColumn } from '../api/types';
+import type { TableCellValue, TableColumn, TableColumnType } from '../api/types';
 
 /** Display cap for a text cell, in code points (the rest goes to `title`). */
 export const TABLE_CELL_MAX_CHARS = 200;
+
+/** User-facing names of the column types (the editor's type select). */
+export const COLUMN_TYPE_LABELS: Record<TableColumnType, string> = {
+  text: 'Text',
+  number: 'Number',
+  url: 'URL',
+  boolean: 'Checkbox',
+  enum: 'Choice',
+};
+
+/**
+ * A logical table value (cell or column default) as display text, or null
+ * when there is no value (null / undefined, or an empty multi-enum list, as
+ * in the viewer grid). A multi-enum list is joined with ", ", an empty
+ * string stays empty. Booleans are "true" / "false" on every Quest Tables
+ * surface -- the grid's screen-reader text, the Columns panel (its default
+ * select and read-only list), the card previews and History -- as in the
+ * CSV download and the model's tools.
+ */
+export function tableValueText(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'boolean' || typeof value === 'number') return String(value);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return null;
+    return value.map((v) => tableValueText(v) ?? '').join(', ');
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * A column's type in the one vocabulary every Quest Tables surface uses
+ * (the Columns panel's summaries and read-only list, the create_table card's
+ * column table, the schema diff of cards and History): the COLUMN_TYPE_LABELS
+ * name, "Choice (several)" for a choice column that allows several options,
+ * "Number (2 decimal places)" for a number with a precision. A type the
+ * client does not know shows as sent.
+ */
+export function columnTypeLabel(column: {
+  type: string;
+  multiple?: boolean | null;
+  precision?: number | null;
+}): string {
+  const label = COLUMN_TYPE_LABELS[column.type as TableColumnType] ?? column.type;
+  if (column.type === 'enum' && column.multiple) return `${label} (several)`;
+  if (column.type === 'number' && typeof column.precision === 'number') {
+    return `${label} (${column.precision} ${column.precision === 1 ? 'decimal place' : 'decimal places'})`;
+  }
+  return label;
+}
 
 const DECIMAL_RE = /^(-?)(\d+)(?:\.(\d+))?$/;
 
@@ -146,7 +196,7 @@ export function TableCell({
           ) : (
             <Square size={16} className="table-cell-check" aria-hidden="true" />
           )}
-          <span className="table-cell-sr-only">{checked ? 'true' : 'false'}</span>
+          <span className="table-cell-sr-only">{tableValueText(checked)}</span>
         </td>
       );
     }

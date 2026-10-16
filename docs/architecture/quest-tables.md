@@ -214,7 +214,7 @@ Four routers under `/app/api`, mounted in `quest.py`, are the UI surface; their 
 
 ## Frontend
 
-The `/tables` views (sidebar blocks, All Tables, the viewer with its filter bar and grid) and how they consume the routes and events are in [Quest Tables Frontend](quest-tables-frontend.md).
+The `/tables` views (sidebar blocks, All Tables, the viewer with its grid, schema editor and History drawer), the card previews and how they consume the routes and events are in [Quest Tables Frontend](quest-tables-frontend.md).
 
 ## Realtime Events
 
@@ -239,7 +239,7 @@ The off-by-default, per-user `tables` gate (`FEATURE_TABLES`, `tables_enabled_fo
 
 ## Constraints
 
-- Every cap shared across modules lives in `chat/tables/constants.py`, and consumers read it from there rather than repeating it; listing limits live with the tools and routes that enforce them.
+- Every cap shared across modules lives in `chat/tables/constants.py`, and consumers read it from there; listing limits live with the tools and routes that enforce them.
 - `TABLE_TITLE_MAX_LEN` matches the `String(200)` title column; raising it needs a migration.
 
 ## Design Decisions

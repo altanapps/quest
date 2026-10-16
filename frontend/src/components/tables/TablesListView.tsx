@@ -22,12 +22,24 @@
  * utils/docMode (DocModeBadge): only a public table shows one, and the "Mode"
  * column label is shown only while some rendered row is public.
  *
- * New Table. The schema editor dialog arrives in phase B5: the host passes
- * `onNewTable` to open it. Without it the button renders disabled
- * ("Coming soon").
+ * New Table opens NewTableDialog (title, description, location preselected
+ * to the filtered project, and the column editor), which creates the table
+ * and navigates to it; closed without creating, it returns focus to the
+ * button that opened it. A host may pass `onNewTable` to open something
+ * else instead; then the view renders no dialog of its own.
+ *
+ * Empty states: no tables at all (or none in the filtered project) explain
+ * in a line what a table is for and offer the same dialog ("Create a
+ * table") beside the header's New Table; a group with no tables while
+ * others have some says so in its own line. A public project's line does
+ * not send the user to ask Quest: its conversations can read and write its
+ * tables but not create one (`_PUBLIC_TABLES_SECTION` in
+ * chat/gemini_api/system_prompt.py). A failed load is never "no tables":
+ * while the own or shared list or some project's index failed, the view
+ * shows the groups it has and the failure instead of the empty state.
  */
 
-import { useMemo, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { ChevronLeft, Folder, Globe, Plus, Users } from 'lucide-react';
 import type { Project, TableListRow } from '../../api/types';
@@ -50,6 +62,7 @@ import { shouldShowDocModeBadge } from '../../utils/docMode';
 import { tableViewerPath, tablesListPath } from '../../utils/tablesRoute';
 import { formatRelativeTimestamp, parseUTCTimestamp } from '../../utils/formatters';
 import { DocModeBadge } from '../docs/DocModeBadge';
+import { NewTableDialog } from './NewTableDialog';
 import './TablesListView.css';
 
 /** Page size of the server-paged lists ("Your tables" / "Shared with you",
@@ -58,12 +71,26 @@ const PAGE_SIZE = 50;
 
 const PUBLIC_PROJECT_TITLE = 'Public project — internet access, no internal data';
 
+export const EMPTY_HINT =
+  'A table holds typed rows that Quest reads and writes in your chats. Ask Quest to create one, or create one here.';
+export const PROJECT_EMPTY_HINT =
+  "This project's conversations can read and write its tables. Ask Quest in one of them to create a table, or create one here.";
+/** A public project: its conversations cannot create tables. */
+export const PUBLIC_PROJECT_EMPTY_HINT =
+  "This project's conversations can read and write its tables, but only you can create one here.";
+
+/** The empty state's line: all tables, a project, or a public project. */
+export function emptyHint(filtered: boolean, project: Project | null): string {
+  if (!filtered) return EMPTY_HINT;
+  return project?.public ? PUBLIC_PROJECT_EMPTY_HINT : PROJECT_EMPTY_HINT;
+}
+
 export interface TablesListViewProps {
   /** The `?project=<id>` filter; null = all tables. */
   projectId: string | null;
   /**
-   * Opens the New Table (schema editor) dialog. Phase B5 supplies it; while
-   * absent the "New Table" button is disabled with a "Coming soon" title.
+   * Overrides the New Table button; without it the view opens its own
+   * NewTableDialog.
    */
   onNewTable?: () => void;
 }
@@ -71,6 +98,34 @@ export interface TablesListViewProps {
 export function TablesListView({ projectId, onNewTable }: TablesListViewProps) {
   const { projects, projectsLoaded } = useProjects();
   const filtered = projectId !== null;
+  const [newTableOpen, setNewTableOpen] = useState(false);
+  // The button that opened the dialog (the header's New Table, or the empty
+  // state's): focus goes back to it when the dialog closes.
+  const newButtonRef = useRef<HTMLButtonElement>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
+  const openNewTable = (event: { currentTarget: HTMLElement }) => {
+    if (onNewTable) {
+      onNewTable();
+      return;
+    }
+    openerRef.current = event.currentTarget;
+    setNewTableOpen(true);
+  };
+  // The dialog closed (without navigating away): focus back on its opener,
+  // unless focus already went somewhere else on the page.
+  const [dialogClosed, setDialogClosed] = useState(0);
+  const closeNewTable = () => {
+    setNewTableOpen(false);
+    setDialogClosed((n) => n + 1);
+  };
+  useEffect(() => {
+    if (dialogClosed === 0) return;
+    const active = document.activeElement;
+    if (!active || active === document.body || !active.isConnected) {
+      const opener = openerRef.current?.isConnected ? openerRef.current : newButtonRef.current;
+      opener?.focus();
+    }
+  }, [dialogClosed]);
 
   // One paged list (the user's tables, or the filtered project's) plus the
   // shared list and the per-project index, which only the unfiltered view
@@ -128,15 +183,17 @@ export function TablesListView({ projectId, onNewTable }: TablesListViewProps) {
   let body: ReactNode;
   if (loading) {
     body = <div className="tables-list-status">Loading...</div>;
-  } else if (totalTables === 0 && !list.error && !shared.error) {
+  } else if (totalTables === 0 && !list.error && !shared.error && index.failedProjectIds.length === 0) {
     body = (
       <div className="tables-list-empty">
         <p className="tables-list-empty-title">
           {filtered ? 'No tables in this project yet.' : 'No tables yet.'}
         </p>
-        <p className="tables-list-empty-hint">
-          {onNewTable ? 'Ask Quest to create one, or use New Table.' : 'Ask Quest to create one.'}
-        </p>
+        <p className="tables-list-empty-hint">{emptyHint(filtered, filterProject)}</p>
+        <button type="button" className="tables-list-empty-button" onClick={openNewTable}>
+          <Plus size={15} aria-hidden="true" />
+          Create a table
+        </button>
       </div>
     );
   } else {
@@ -240,25 +297,10 @@ export function TablesListView({ projectId, onNewTable }: TablesListViewProps) {
             </h2>
           </div>
           <div className="tables-list-actions">
-            {onNewTable ? (
-              <button type="button" className="tables-list-new-button" onClick={onNewTable}>
-                <Plus size={16} aria-hidden="true" />
-                New Table
-              </button>
-            ) : (
-              // B5 brings the schema editor dialog; until then the button is
-              // visible but inert (disabled, so not focusable or clickable).
-              <button
-                type="button"
-                className="tables-list-new-button"
-                disabled
-                title="Coming soon"
-              >
-                <Plus size={16} aria-hidden="true" />
-                New Table
-                <span className="tables-list-new-hint"> (coming soon)</span>
-              </button>
-            )}
+            <button type="button" ref={newButtonRef} className="tables-list-new-button" onClick={openNewTable}>
+              <Plus size={16} aria-hidden="true" />
+              New Table
+            </button>
           </div>
         </div>
       </header>
@@ -273,6 +315,15 @@ export function TablesListView({ projectId, onNewTable }: TablesListViewProps) {
           )}
         </div>
       </div>
+
+      {!onNewTable && (
+        <NewTableDialog
+          isOpen={newTableOpen}
+          onClose={closeNewTable}
+          projects={projects}
+          initialProjectId={projectId}
+        />
+      )}
     </div>
   );
 }

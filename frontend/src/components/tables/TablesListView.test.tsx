@@ -4,7 +4,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiClientError } from '../../api/request';
 import type { ListTablesOptions } from '../../api/tablesApi';
 import type { ListTablesResponse, Project, TableListRow } from '../../api/types';
-import { TablesListView } from './TablesListView';
+import {
+  EMPTY_HINT,
+  PROJECT_EMPTY_HINT,
+  PUBLIC_PROJECT_EMPTY_HINT,
+  TablesListView,
+  emptyHint,
+} from './TablesListView';
 
 type GlobalListener = (event: { type: string; [key: string]: unknown }) => void;
 
@@ -248,8 +254,15 @@ describe('TablesListView', () => {
     expect(screen.getByText('Loading...')).toBeTruthy();
     resolveOwn(page([]));
     await waitFor(() => expect(screen.getByText('No tables yet.')).toBeTruthy());
-    // New Table is inert until the schema editor lands, so the hint omits it.
-    expect(screen.getByText('Ask Quest to create one.')).toBeTruthy();
+    // A line on what a table is for, and a button that opens the dialog.
+    expect(screen.getByText(EMPTY_HINT)).toBeTruthy();
+    const create = screen.getByRole('button', { name: 'Create a table' });
+    fireEvent.click(create);
+    const dialog = screen.getByRole('dialog', { name: 'New Table' });
+    expect((within(dialog).getByLabelText('Location') as HTMLSelectElement).value).toBe('');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    // Focus back on the button that opened it.
+    expect(document.activeElement).toBe(create);
   });
 
   it('shows the filtered empty state', async () => {
@@ -257,6 +270,41 @@ describe('TablesListView', () => {
     mocks.listTables.mockResolvedValue(page([]));
     renderView('pa');
     await waitFor(() => expect(screen.getByText('No tables in this project yet.')).toBeTruthy());
+    expect(screen.getByText(PROJECT_EMPTY_HINT)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Create a table' }));
+    const dialog = screen.getByRole('dialog', { name: 'New Table' });
+    expect((within(dialog).getByLabelText('Location') as HTMLSelectElement).value).toBe('pa');
+  });
+
+  it("a public project's empty state does not send the user to ask Quest", async () => {
+    mocks.projects = [project('pp', 'Open data', { public: true })];
+    mocks.listTables.mockResolvedValue(page([]));
+    renderView('pp');
+    await waitFor(() => expect(screen.getByText('No tables in this project yet.')).toBeTruthy());
+    expect(screen.getByText(PUBLIC_PROJECT_EMPTY_HINT)).toBeTruthy();
+    expect(screen.queryByText(/Ask Quest/)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Create a table' })).toBeTruthy();
+  });
+
+  it('emptyHint picks the line by view and project', () => {
+    expect(emptyHint(false, null)).toBe(EMPTY_HINT);
+    expect(emptyHint(true, null)).toBe(PROJECT_EMPTY_HINT);
+    expect(emptyHint(true, project('pa', 'Alpha'))).toBe(PROJECT_EMPTY_HINT);
+    expect(emptyHint(true, project('pp', 'Open', { public: true }))).toBe(PUBLIC_PROJECT_EMPTY_HINT);
+  });
+
+  it('never reads as "No tables yet." while a project index failed', async () => {
+    mocks.projects = [project('pa', 'Alpha')];
+    mocks.listTables.mockImplementation(async (opts) => {
+      if (opts.projectId) throw new Error('boom');
+      return page([]);
+    });
+    renderView(null);
+    await waitFor(() => expect(screen.getByText('Some project tables could not be loaded.')).toBeTruthy());
+    expect(screen.queryByText('No tables yet.')).toBeNull();
+    expect(screen.queryByText(EMPTY_HINT)).toBeNull();
+    // The own group stays, saying it is empty.
+    expect(within(screen.getByRole('region', { name: 'Your tables' })).getByText('No tables of your own yet.')).toBeTruthy();
   });
 
   it('reports a failed own list and a failed shared list', async () => {
@@ -273,14 +321,22 @@ describe('TablesListView', () => {
     expect(screen.queryByRole('region', { name: 'Your tables' })).toBeNull();
   });
 
-  it('renders New Table disabled ("Coming soon") without onNewTable', async () => {
+  it('opens its own New Table dialog without onNewTable', async () => {
     mocks.listTables.mockResolvedValue(page([]));
-    renderView(null);
-    const button = screen.getByRole('button', { name: /New Table/ }) as HTMLButtonElement;
-    expect(button.disabled).toBe(true);
-    expect(button.textContent).toContain('(coming soon)');
-    expect(button.getAttribute('title')).toBe('Coming soon');
-    await waitFor(() => expect(screen.getByText('No tables yet.')).toBeTruthy());
+    mocks.projects = [project('p1', 'Sales')];
+    renderView('p1');
+    const button = screen.getByRole('button', { name: 'New Table' }) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    fireEvent.click(button);
+    const dialog = screen.getByRole('dialog', { name: 'New Table' });
+    // Preselected to the filtered project.
+    expect((within(dialog).getByLabelText('Location') as HTMLSelectElement).value).toBe('p1');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    // Closed without creating: focus back on the button that opened it.
+    expect(document.activeElement).toBe(button);
+    await waitFor(() => expect(screen.getByText('No tables in this project yet.')).toBeTruthy());
   });
 
   it('calls onNewTable from an enabled New Table button', async () => {
@@ -293,7 +349,10 @@ describe('TablesListView', () => {
     fireEvent.click(button);
     expect(onNewTable).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(screen.getByText('No tables yet.')).toBeTruthy());
-    expect(screen.getByText('Ask Quest to create one, or use New Table.')).toBeTruthy();
+    // The empty state's button goes to the host too.
+    fireEvent.click(screen.getByRole('button', { name: 'Create a table' }));
+    expect(onNewTable).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole('dialog')).toBeNull();
   });
 
   it('shows an error under a generic heading for an unknown or foreign project', async () => {
