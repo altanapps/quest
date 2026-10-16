@@ -233,6 +233,12 @@ A project delete (`delete_user_project()` in `chat/project_routes.py`) collects 
 
 The off-by-default, per-user `tables` gate (`FEATURE_TABLES`, `tables_enabled_for()`) is mirrored into the connected-services map as the pseudo-key `tables` (`TABLES_SERVICE_KEY`), so tools and skills that declare `requires_service: "tables"` drop out of the prompt while the gate is closed for the user. The gate deletes nothing. See [Feature Gates -- Enforcement Layers (Quest Tables)](feature-gates.md#enforcement-layers-quest-tables).
 
+## Frontend
+
+`frontend/src/components/tables/TablesView.tsx` gates the data tree; table links show a viewer placeholder. URL helpers in `frontend/src/utils/tablesRoute.ts` serve both shells.
+
+`frontend/src/components/tables/TablesListView.tsx` groups user, shared and project tables. Groups page independently through `frontend/src/hooks/useTables.ts` and `frontend/src/api/tablesApi.ts`. Search covers loaded rows. The hook debounces `table_list_changed` and ignores superseded responses. `frontend/src/components/sidebar/TablesSection.tsx` renders gated navigation.
+
 ## Constraints
 
 - Every cap shared across modules lives in `chat/tables/constants.py`, and consumers read it from there rather than repeating it; listing limits live with the tools and routes that enforce them.

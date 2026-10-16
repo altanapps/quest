@@ -1,0 +1,76 @@
+.tables-list {
+  width: 100%;
+  max-width: 1100px;
+  margin: 0 auto;
+  min-width: 0;
+}
+
+.tables-list-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem 2rem 0.75rem;
+  background: var(--surface);
+}
+
+.tables-list-header h2 { margin: 0.25rem 0; font-size: 1.25rem; }
+.tables-list-search { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
+.tables-list-search input {
+  width: 15rem;
+  max-width: 100%;
+  min-width: 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  color: var(--text);
+  font: inherit;
+}
+.tables-list-content { padding: 0.5rem 2rem 2rem; }
+.tables-list-group { margin: 1.5rem 0; overflow-x: auto; }
+.tables-list-group h3 { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; }
+.tables-list-muted, .tables-list-description { color: var(--text-muted); font-size: 0.8125rem; }
+.tables-list-description { display: block; overflow-wrap: anywhere; margin-top: 0.2rem; }
+.tables-index { width: 100%; border-collapse: collapse; font-size: 0.8125rem; text-align: left; }
+.tables-caption {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.tables-index th { color: var(--text-muted); font-weight: 500; white-space: nowrap; }
+.tables-index th, .tables-index td { padding: 0.7rem 0.5rem; }
+.tables-index td { border-top: 1px solid var(--border); }
+.tables-title-cell { min-width: 10rem; max-width: 22rem; overflow-wrap: anywhere; }
+.tables-title-cell a { font-weight: 500; color: var(--text); }
+.tables-number { font-variant-numeric: tabular-nums; }
+.tables-mode { display: inline-flex; align-items: center; gap: 0.25rem; font-size: 0.75rem; }
+.tables-load-more { margin-top: 0.5rem; }
+.tables-status {
+  margin: auto;
+  max-width: 36rem;
+  padding: 3rem 1.5rem;
+  text-align: center;
+  color: var(--text-secondary);
+}
+.tables-list a:focus-visible, .tables-list button:focus-visible, .tables-status a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+@media (hover: hover) and (pointer: fine) {
+  .tables-index tbody tr:hover { background: var(--hover); }
+}
+@media (max-width: 768px) {
+  .tables-list-header { padding: 1rem; }
+  .tables-list-content { padding: 0.5rem 1rem 2rem; }
+  .tables-list-search { width: 100%; }
+  .tables-list-search input { flex: 1; width: 100%; font-size: 16px; }
+}

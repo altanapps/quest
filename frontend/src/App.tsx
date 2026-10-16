@@ -21,6 +21,9 @@ import { DocsGateClosed } from './components/docs/DocsGateClosed'
 import { DOCS_FEATURE } from './api/docsApi'
 import { useIsMobile } from './hooks/useIsMobile'
 import { parseDocsRoute } from './utils/docsRoute'
+import { TABLES_FEATURE } from './api/tablesApi'
+import { parseTablesRoute } from './utils/tablesRoute'
+import { TablesView } from './components/tables/TablesView'
 import { LazyBoundary, lazyNamed } from './components/LazyBoundary'
 
 // Admin-only page: a separate chunk, fetched on the first visit.
@@ -52,6 +55,9 @@ function AppContent() {
   // NavigationContext flag, and activeConversationId is null on these routes.
   const docsRoute = parseDocsRoute(location.pathname, location.search)
   const docsEnabled = enabledFeatures.includes(DOCS_FEATURE)
+  const tablesRoute = parseTablesRoute(location.pathname, location.search)
+  const isTablesRoute = location.pathname === '/tables' || location.pathname.startsWith('/tables/')
+  const tablesEnabled = enabledFeatures.includes(TABLES_FEATURE)
 
   // Sync URL -> requests-inbox state. /inbox is the deep-linkable address of
   // the RequestsView (linked from Slack pending-request reminder DMs); any
@@ -147,6 +153,9 @@ function AppContent() {
         onProjectIdLoaded={handleProjectIdLoaded}
         docsRoute={docsRoute}
         docsEnabled={docsEnabled}
+        tablesRoute={tablesRoute}
+        isTablesRoute={isTablesRoute}
+        tablesEnabled={tablesEnabled}
       />
     )
   }
@@ -160,6 +169,10 @@ function AppContent() {
       />
       {showRequestsView ? (
         <RequestsView />
+      ) : isTablesRoute ? (
+        <div className="main-content docs-main">
+          <TablesView route={tablesRoute} enabled={tablesEnabled} />
+        </div>
       ) : docsRoute ? (
         // Full takeover like RequestsView: no RightPanel beside a docs view.
         <div className="main-content docs-main">
@@ -237,6 +250,8 @@ function App() {
         {/* Quest Docs: All Docs (?project=<id> filter) and the viewer. */}
         <Route path="/docs" element={<AppContent />} />
         <Route path="/docs/:docId" element={<AppContent />} />
+        <Route path="/tables" element={<AppContent />} />
+        <Route path="/tables/*" element={<AppContent />} />
         {/* Set-password links (invites, sign-up, resets); works signed out. */}
         <Route path="/set-password" element={<SetPasswordScreen />} />
         <Route path="/admin/system-reports" element={<AdminSystemReportsRoute />} />

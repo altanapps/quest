@@ -22,7 +22,7 @@ const PROJECT: Project = {
   conversation_count: 0,
 };
 
-function renderPanel(props: { showRoutines: boolean; showDocs: boolean }) {
+function renderPanel(props: { showRoutines: boolean; showDocs: boolean; showTables?: boolean }) {
   const noop = vi.fn();
   return render(
     <ProjectPanel
@@ -50,6 +50,7 @@ function renderPanel(props: { showRoutines: boolean; showDocs: boolean }) {
       onArchived={noop}
       showDocs={props.showDocs}
       docs={[]}
+      showTables={props.showTables}
     />,
   );
 }
@@ -79,6 +80,19 @@ describe('ProjectPanel', () => {
     expect(
       [...container.querySelectorAll('.section-label')].map((label) => label.textContent),
     ).toEqual(['Routines', 'Docs', 'Conversations']);
+  });
+
+  it('places gated Tables below Docs and above Conversations', () => {
+    const { container } = renderPanel({ showRoutines: true, showDocs: true, showTables: true });
+    expect(
+      [...container.querySelectorAll('.section-label')].map((label) => label.textContent),
+    ).toEqual(['Routines', 'Docs', 'Tables', 'Conversations']);
+  });
+
+  it('hides Tables independently of the Docs gate', () => {
+    const { container } = renderPanel({ showRoutines: false, showDocs: true, showTables: false });
+    expect(container.querySelector('.tables-section')).toBeNull();
+    expect(container.querySelector('.docs-section')).not.toBeNull();
   });
 
   it('leaves out the Routines and Docs blocks when their flags are off', () => {

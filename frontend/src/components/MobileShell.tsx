@@ -15,6 +15,8 @@ import { DocsListView } from './docs/DocsListView'
 import { DocViewer } from './docs/DocViewer'
 import { DocsGateClosed } from './docs/DocsGateClosed'
 import type { DocsRoute } from '../utils/docsRoute'
+import type { TablesRoute } from '../utils/tablesRoute'
+import { TablesView } from './tables/TablesView'
 
 interface MobileShellProps {
   activeConversationId: string | null
@@ -26,6 +28,9 @@ interface MobileShellProps {
   docsRoute: DocsRoute | null
   /** Whether the `docs` feature gate is open for the current user. */
   docsEnabled: boolean
+  tablesRoute?: TablesRoute | null
+  isTablesRoute?: boolean
+  tablesEnabled?: boolean
 }
 
 interface ConversationSelectOpts {
@@ -48,6 +53,9 @@ export function MobileShell({
   onProjectIdLoaded,
   docsRoute,
   docsEnabled,
+  tablesRoute = null,
+  isTablesRoute = false,
+  tablesEnabled = false,
 }: MobileShellProps) {
   const { appName } = useAppConfig()
   const {
@@ -135,6 +143,17 @@ export function MobileShell({
     setWorkspaceOpen(false)
   }, [docsRouteKey])
 
+  const tablesRouteKey = isTablesRoute
+    ? tablesRoute?.kind === 'list'
+      ? `list:${tablesRoute.projectId ?? ''}`
+      : `viewer:${tablesRoute?.tableId ?? 'invalid'}`
+    : null
+  useEffect(() => {
+    if (tablesRouteKey === null) return
+    setDrawerOpen(false)
+    setWorkspaceOpen(false)
+  }, [tablesRouteKey])
+
   const closeOverlays = useCallback(() => {
     setDrawerOpen(false)
     setWorkspaceOpen(false)
@@ -200,7 +219,7 @@ export function MobileShell({
         </div>
         {/* No workspace beside a docs view (desktop hides the RightPanel
             there too); keep the slot so the title stays put. */}
-        {docsRoute ? (
+        {docsRoute || isTablesRoute ? (
           <span className="mobile-topbar-button mobile-topbar-button-end" aria-hidden="true" />
         ) : (
           <button
@@ -219,6 +238,10 @@ export function MobileShell({
       <div className="mobile-main">
         {showRequestsView ? (
           <RequestsView />
+        ) : isTablesRoute ? (
+          <div className="main-content docs-main">
+            <TablesView route={tablesRoute} enabled={tablesEnabled} />
+          </div>
         ) : docsRoute ? (
           <div className="main-content docs-main">
             {!docsEnabled ? (

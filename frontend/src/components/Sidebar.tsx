@@ -22,6 +22,10 @@ import {
   ApiClientError,
 } from '../api/client';
 import { DOCS_FEATURE } from '../api/docsApi';
+import { TABLES_FEATURE, SIDEBAR_TABLE_LIMIT } from '../api/tablesApi';
+import { useTables } from '../hooks/useTables';
+import { parseTablesRoute, tablesListPath, tableViewerPath } from '../utils/tablesRoute';
+import { TablesSection } from './sidebar/TablesSection';
 import type { Conversation, Routine } from '../api/types';
 import { useAppConfig } from '../contexts/AppConfigContext';
 import { useAuth } from '../contexts/AuthContext';
@@ -129,6 +133,23 @@ export const Sidebar = React.memo(function Sidebar({
   // The project id of the All Docs view showing (null = unfiltered), or
   // undefined when no All Docs view is showing.
   const docsListProjectId = docsRoute?.kind === 'list' ? docsRoute.projectId : undefined;
+  const tablesEnabled = enabledFeatures.includes(TABLES_FEATURE);
+  const userTables = useTables({ limit: SIDEBAR_TABLE_LIMIT, enabled: tablesEnabled });
+  const projectTables = useTables({
+    projectId: drilledProjectId,
+    limit: SIDEBAR_TABLE_LIMIT,
+    enabled: tablesEnabled && drilledProjectId !== null,
+  });
+  const tablesRoute = parseTablesRoute(location.pathname, location.search);
+  const activeTableId = tablesRoute?.kind === 'viewer' ? tablesRoute.tableId : null;
+  const tablesListProjectId = tablesRoute?.kind === 'list' ? tablesRoute.projectId : undefined;
+
+  function handleOpenTables(path: string) {
+    setError(null);
+    setShowRequestsView(false);
+    navigate(path);
+    onNavigateAway?.();
+  }
 
   // Per-project conversation filters. Default to false (hide archived, hide
   // Slack conversations) on every page load; no persistence. Independent of
@@ -511,6 +532,18 @@ export const Sidebar = React.memo(function Sidebar({
               />
             )}
 
+            {tablesEnabled && (
+              <TablesSection
+                tables={userTables.tables}
+                loading={userTables.loading}
+                error={userTables.error}
+                activeTableId={activeTableId}
+                onOpenTable={(id) => handleOpenTables(tableViewerPath(id))}
+                onOpenAll={() => handleOpenTables(tablesListPath())}
+                headerActive={tablesListProjectId === null}
+              />
+            )}
+
             <ConversationsSection
               list={topLevel}
               activeConversationId={highlightedConversationId}
@@ -560,6 +593,14 @@ export const Sidebar = React.memo(function Sidebar({
                 onOpenDoc={handleOpenDoc}
                 onOpenAllDocs={() => handleOpenAllDocs(drilledProject.id)}
                 docsHeaderActive={docsListProjectId === drilledProject.id}
+                showTables={tablesEnabled}
+                tables={projectTables.tables}
+                tablesLoading={projectTables.loading}
+                tablesError={projectTables.error}
+                activeTableId={activeTableId}
+                onOpenTable={(id) => handleOpenTables(tableViewerPath(id))}
+                onOpenAllTables={() => handleOpenTables(tablesListPath(drilledProject.id))}
+                tablesHeaderActive={tablesListProjectId === drilledProject.id}
               />
             )}
           </div>

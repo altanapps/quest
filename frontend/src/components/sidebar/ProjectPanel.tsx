@@ -16,6 +16,8 @@ import { deriveProjectSidebarItems } from '../../utils/sidebarItems';
 import { ConversationFilterMenu } from './ConversationFilterMenu';
 import { ConversationRow } from './ConversationRow';
 import { DocsSection } from './DocsSection';
+import { TablesSection } from './TablesSection';
+import type { QuestTable } from '../../api/tablesApi';
 import { RoutinesSection } from './RoutinesSection';
 import {
   ChevronLeftIcon,
@@ -71,9 +73,18 @@ interface ProjectPanelProps {
   onOpenAllDocs?: () => void;
   // That filtered All Docs view is the one showing.
   docsHeaderActive?: boolean;
+  showTables?: boolean;
+  tables?: QuestTable[];
+  tablesLoading?: boolean;
+  tablesError?: string | null;
+  activeTableId?: string | null;
+  onOpenTable?: (id: string) => void;
+  onOpenAllTables?: () => void;
+  tablesHeaderActive?: boolean;
 }
 
 const NO_DOCS: Doc[] = [];
+const NO_TABLES: QuestTable[] = [];
 const noop = () => {};
 
 export function ProjectPanel({
@@ -107,6 +118,14 @@ export function ProjectPanel({
   onOpenDoc = noop,
   onOpenAllDocs = noop,
   docsHeaderActive = false,
+  showTables = false,
+  tables = NO_TABLES,
+  tablesLoading = false,
+  tablesError = null,
+  activeTableId = null,
+  onOpenTable = noop,
+  onOpenAllTables = noop,
+  tablesHeaderActive = false,
 }: ProjectPanelProps) {
   const listRef = useFlipListAnimation<HTMLDivElement>();
   // Held here, not in the popover: toggling the archive filter reloads the
@@ -182,6 +201,17 @@ export function ProjectPanel({
               />
             )}
 
+            {showTables && (
+              <TablesSection
+                tables={tables}
+                loading={tablesLoading}
+                error={tablesError}
+                activeTableId={activeTableId}
+                onOpenTable={onOpenTable}
+                onOpenAll={onOpenAllTables}
+                headerActive={tablesHeaderActive}
+              />
+            )}
             {/* Conversations section header */}
             <div className="section-header">
               <div className="section-label">Conversations</div>
