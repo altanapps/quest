@@ -20,11 +20,13 @@ import json
 import logging
 import os
 import re
+import tempfile
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+import aiofiles
 import httpx
 from fastapi import Depends
 from fastapi.responses import JSONResponse, Response
@@ -817,6 +819,64 @@ def _connection_not_found_error(service: dict[str, Any], exc: ConnectionNotFound
 # Internal request helper
 # ---------------------------------------------------------------------------
 
+async def _stream_authed_download(
+    client: httpx.AsyncClient,
+    url: httpx.URL,
+    headers: dict[str, str],
+    destination: Path,
+    max_bytes: int,
+) -> httpx.Response:
+    """Stream a bounded download, replacing the destination only on success.
+
+    Error bodies are bounded too, retaining upstream-error and OAuth-retry
+    handling. Successful responses carry headers, not buffered file content.
+    """
+    chunk_size = 64 * 1024
+    async with client.stream("GET", url, headers=headers) as response:
+        if response.status_code >= 400:
+            body = bytearray()
+            async for chunk in response.aiter_bytes(chunk_size=chunk_size):
+                body.extend(chunk[:chunk_size - len(body)])
+                if len(body) >= chunk_size:
+                    break
+            # aiter_bytes already decoded content; do not decode it twice
+            # or retain the encoded body's length on the buffered response.
+            error_headers = {
+                key: value for key, value in response.headers.items()
+                if key not in {"content-encoding", "content-length", "transfer-encoding"}
+            }
+            return httpx.Response(
+                response.status_code, headers=error_headers,
+                content=bytes(body), request=response.request,
+            )
+        if not 200 <= response.status_code < 300:
+            raise ValueError(f"Unexpected download status: {response.status_code}")
+
+        length = response.headers.get("content-length", "")
+        if length.isascii() and length.isdigit() and int(length) > max_bytes:
+            raise ValueError(f"Download exceeds the {max_bytes}-byte size limit.")
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=destination.parent, prefix=".drive-download-", delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+            size = 0
+            async with aiofiles.open(temporary_path, "wb") as output:
+                async for chunk in response.aiter_bytes(chunk_size=chunk_size):
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise ValueError(f"Download exceeds the {max_bytes}-byte size limit.")
+                    await output.write(chunk)
+            os.replace(temporary_path, destination)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        return response
+
+
 async def _make_authed_request(
     url: str,
     headers: dict[str, str] | None = None,
@@ -826,6 +886,8 @@ async def _make_authed_request(
     method: str = "GET",
     json_body: dict | None = None,
     connection: str | None = None,
+    download_to: Path | None = None,
+    max_download_bytes: int | None = None,
 ) -> str | httpx.Response:
     """Core authenticated request logic shared by the tool handlers and HTTP endpoints.
 
@@ -849,6 +911,12 @@ async def _make_authed_request(
     directly on success so callers can access ``.content`` for binary data.
     On failure, still returns a JSON error string.
 
+    Internal callers may set *download_to* and a positive
+    *max_download_bytes* with GET and *raw_response=True*. The response body
+    is streamed to disk with atomic replacement and is NOT available via
+    ``.content``; only response metadata is returned. Buffered callers
+    are unchanged.
+
     *connection* names one of the user's connections (an account address)
     for a multi-connection service. It is passed to the loader only when the
     matched entry sets ``accepts_connection``; for any other service a
@@ -864,6 +932,17 @@ async def _make_authed_request(
         3. ``inject_auth`` result -- always wins so auth headers cannot be clobbered.
     """
     method = method.upper()
+    if download_to is not None or max_download_bytes is not None:
+        if (
+            download_to is None or type(max_download_bytes) is not int
+            or max_download_bytes <= 0 or method != "GET" or not raw_response
+        ):
+            return json.dumps({
+                "error": (
+                    "Downloads require GET, raw_response=True, a destination, "
+                    "and a positive byte limit."
+                ),
+            })
     # --- URL validation ---------------------------------------------------
     # One parse, shared by every check below AND by the send: the registry
     # lookup and allow-list match read the path exactly as httpx puts it on
@@ -994,7 +1073,11 @@ async def _make_authed_request(
     # --- HTTP request -----------------------------------------------------
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            if method == "POST":
+            if download_to is not None:
+                response = await _stream_authed_download(
+                    client, target.url, request_headers, download_to, max_download_bytes,
+                )
+            elif method == "POST":
                 response = await client.post(target.url, headers=request_headers, json=json_body)
             else:
                 response = await client.get(target.url, headers=request_headers)
@@ -1030,7 +1113,11 @@ async def _make_authed_request(
                 if headers:
                     request_headers.update(headers)
                 service["inject_auth"](credentials, request_headers)
-                if method == "POST":
+                if download_to is not None:
+                    response = await _stream_authed_download(
+                        client, target.url, request_headers, download_to, max_download_bytes,
+                    )
+                elif method == "POST":
                     response = await client.post(target.url, headers=request_headers, json=json_body)
                 else:
                     response = await client.get(target.url, headers=request_headers)
@@ -1125,8 +1212,7 @@ async def _handle_authed_get_to_file(
     response size gate. Shared by ``authed_get`` (GET) and ``authed_post``
     (POST) via *method* / *json_body*.
 
-    Note on size cap: matches ``download_drive_file`` /
-    ``github_get_job_log`` -- no extra cap beyond
+    Note on size cap: matches ``github_get_job_log`` -- no extra cap beyond
     the upstream-imposed limits and the in-process httpx 30s timeout.
     The user opted in by passing ``output_file``.
     """
