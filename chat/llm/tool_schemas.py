@@ -723,6 +723,9 @@ TOOL_CALL_REGISTRY: dict[str, ToolSpec] = {
         "description": (
             "Download a Google Drive file's binary content to this conversation's workspace. "
             "Use this to download PDFs, images, spreadsheets, and other files from Google Drive. "
+            "Drive shortcuts are resolved automatically to their target files. "
+            "Native Google Docs, Sheets, and Slides require google_export_doc, "
+            "google_export_sheet, or google_export_slides instead; folders cannot be downloaded. "
             "After downloading, use get_workspace_file to read or analyze the file. "
             "Requires Google Services to be connected."
         ),
@@ -732,7 +735,7 @@ TOOL_CALL_REGISTRY: dict[str, ToolSpec] = {
                 "file_id": {
                     "type": "string",
                     "description": (
-                        "The Google Drive file ID. Found in Drive URLs or from the "
+                        "The Google Drive file or shortcut ID. Found in Drive URLs or from the "
                         "Drive API files list endpoint."
                     ),
                 },
@@ -740,7 +743,7 @@ TOOL_CALL_REGISTRY: dict[str, ToolSpec] = {
                     "type": "string",
                     "description": (
                         "Optional filename to save the file as in the workspace. "
-                        "If not provided, the original filename from Drive metadata is used."
+                        "If not provided, the resolved target's filename from Drive metadata is used."
                     ),
                 },
                 "intent_message": {

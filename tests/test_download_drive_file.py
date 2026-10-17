@@ -8,6 +8,7 @@ No credentials or upstream services are used.
 import asyncio
 import gzip
 import json
+import urllib.parse
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -53,6 +54,8 @@ def env(tmp_path, monkeypatch):
         workspace=workspace,
         metadata={"name": "report.bin", "size": "5"},
         metadata_status=200,
+        metadata_by_id={},
+        metadata_status_by_id={},
         stream=Stream([b"hello"]),
         headers={"content-type": "application/octet-stream"},
         status=200,
@@ -64,7 +67,11 @@ def env(tmp_path, monkeypatch):
     def upstream(request):
         state.requests.append(request)
         if request.url.params.get("alt") != "media":
-            return httpx.Response(state.metadata_status, json=state.metadata)
+            file_id = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                state.metadata_status_by_id.get(file_id, state.metadata_status),
+                json=state.metadata_by_id.get(file_id, state.metadata),
+            )
         status = state.media_statuses.pop(0) if state.media_statuses else state.status
         response = httpx.Response(status, headers=state.headers, stream=state.stream)
         state.responses.append(response)
@@ -111,7 +118,7 @@ def test_success_and_filename_override(env, filename):
     assert result["content_type"] == "application/octet-stream"
     assert (env.workspace / name).read_bytes() == b"hello"
     assert len(env.requests) == 2
-    assert env.requests[0].url.params["fields"] == "name,mimeType,size"
+    assert env.requests[0].url.params["fields"] == "name,mimeType,size,shortcutDetails(targetId)"
     assert all(r.url.params["supportsAllDrives"] == "true" for r in env.requests)
     assert env.stream.closed
     # A success response must never have been buffered.
@@ -345,4 +352,201 @@ def test_invalid_download_options_rejected_before_io(env, overrides):
     assert "Downloads require" in json.loads(result)["error"]
     env.loader.assert_not_awaited()
     assert env.requests == []
+    assert_unchanged(env)
+
+
+def shortcut(target_id):
+    return {
+        "name": "Shortcut alias",
+        "mimeType": "application/vnd.google-apps.shortcut",
+        "shortcutDetails": {"targetId": target_id, "targetMimeType": "application/pdf"},
+    }
+
+
+def setup_shortcut(env, target_metadata=None):
+    env.metadata = shortcut("target1")
+    env.metadata_by_id["target1"] = target_metadata if target_metadata is not None else {
+        "name": "target.pdf", "mimeType": "application/pdf", "size": "5",
+    }
+
+
+@pytest.mark.parametrize("filename", [None, "override.pdf"])
+@pytest.mark.parametrize("project_id", [None, "project"])
+def test_shortcut_downloads_target_bytes_and_uses_target_name(env, filename, project_id):
+    setup_shortcut(env)
+    result = download(env, filename=filename, project_id=project_id)
+    name = filename or "target.pdf"
+    assert result["status"] == "success"
+    assert result["filename"] == name
+    assert result["size_bytes"] == 5
+    assert (env.workspace / name).read_bytes() == b"hello"
+    assert [r.url.path.rsplit("/", 1)[-1] for r in env.requests] == [
+        "file1", "target1", "target1",
+    ]
+    assert env.requests[-1].url.params["alt"] == "media"
+    assert all(r.url.params["supportsAllDrives"] == "true" for r in env.requests)
+    env.publish.assert_called_once_with(USER["id"], "conversation", "conv", project_id)
+
+
+def test_shortcut_does_not_trust_cached_target_mime_or_size(env):
+    setup_shortcut(env)
+    env.metadata["shortcutDetails"]["targetMimeType"] = "application/vnd.google-apps.document"
+    env.metadata["size"] = str(LIMIT + 1)  # only the resolved file's size matters
+    assert download(env)["status"] == "success"
+    assert (env.workspace / "target.pdf").read_bytes() == b"hello"
+
+
+@pytest.mark.parametrize("filename", [None, "override.pdf"])
+def test_shortcut_target_is_size_checked_even_with_override(env, filename):
+    setup_shortcut(env, {"name": "large.pdf", "mimeType": "application/pdf", "size": str(LIMIT + 1)})
+    assert "size limit" in download(env, filename=filename)["error"]
+    assert len(env.requests) == 2
+    assert env.stream.consumed == 0
+    assert_unchanged(env)
+
+
+def test_shortcut_target_still_has_streaming_cap(env):
+    setup_shortcut(env)
+    env.metadata_by_id["target1"].pop("size")
+    env.stream = Stream([b"x" * CHUNK] * 4)
+    assert "size limit" in download(env)["error"]
+    assert env.stream.consumed == 3
+    assert env.stream.closed
+    assert_unchanged(env)
+
+
+@pytest.mark.parametrize("kind,tool,id_param", [
+    ("document", "google_export_doc", "document_id"),
+    ("spreadsheet", "google_export_sheet", "spreadsheet_id"),
+    ("presentation", "google_export_slides", "presentation_id"),
+])
+@pytest.mark.parametrize("via_shortcut", [False, True])
+@pytest.mark.parametrize("filename", [None, "override.pdf"])
+def test_native_files_point_to_correct_export_tool_and_resolved_id(
+    env, kind, tool, id_param, via_shortcut, filename,
+):
+    metadata = {"name": "Native file", "mimeType": f"application/vnd.google-apps.{kind}"}
+    if via_shortcut:
+        setup_shortcut(env, metadata)
+    else:
+        env.metadata = metadata
+    result = download(env, filename=filename)
+    assert "no binary content" in result["error"]
+    assert f'tool_name="{tool}"' in result["hint"]
+    arguments = {id_param: "target1" if via_shortcut else "file1", "format": "pdf"}
+    assert json.dumps(arguments) in result["hint"]
+    assert len(env.requests) == (2 if via_shortcut else 1)
+    assert not any(r.url.params.get("alt") == "media" for r in env.requests)
+    drive.conversation_workspace_dir.assert_not_awaited()
+    assert_unchanged(env)
+
+
+@pytest.mark.parametrize("via_shortcut", [False, True])
+def test_folders_return_listing_guidance_not_a_download(env, via_shortcut):
+    metadata = {"name": "Folder", "mimeType": "application/vnd.google-apps.folder"}
+    if via_shortcut:
+        setup_shortcut(env, metadata)
+    else:
+        env.metadata = metadata
+    result = download(env)
+    assert "folders" in result["error"]
+    assert "authed_get" in result["hint"]
+    url = result["hint"].split(": ", 1)[1]
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    target_id = "target1" if via_shortcut else "file1"
+    assert query["q"] == [f"'{target_id}' in parents and trashed = false"]
+    assert query["supportsAllDrives"] == ["true"]
+    assert query["includeItemsFromAllDrives"] == ["true"]
+    assert not any(r.url.params.get("alt") == "media" for r in env.requests)
+    drive.conversation_workspace_dir.assert_not_awaited()
+    assert_unchanged(env)
+
+
+@pytest.mark.parametrize("kind", ["form", "drawing", "drive-sdk", "unknown"])
+@pytest.mark.parametrize("via_shortcut", [False, True])
+def test_other_workspace_types_fail_without_suggesting_wrong_export(env, kind, via_shortcut):
+    metadata = {"mimeType": f"application/vnd.google-apps.{kind}"}
+    if via_shortcut:
+        setup_shortcut(env, metadata)
+    else:
+        env.metadata = metadata
+    result = download(env)
+    assert "not supported" in result["error"]
+    assert "native application" in result["hint"]
+    assert "google_export_" not in result["hint"]
+    assert not any(r.url.params.get("alt") == "media" for r in env.requests)
+    assert_unchanged(env)
+
+
+@pytest.mark.parametrize("details", [
+    None, [], "bad", {}, {"targetId": None}, {"targetId": 1},
+    {"targetId": ""}, {"targetId": "../escape"},
+    {"targetId": "target/permissions"}, {"targetId": "target?alt=media"},
+    {"targetId": "target#fragment"}, {"targetId": "target%2Fpermissions"},
+    {"targetId": "https://example.com"}, {"targetId": "target\n"},
+])
+def test_missing_or_malformed_shortcut_target_is_rejected(env, details):
+    env.metadata = {"mimeType": "application/vnd.google-apps.shortcut", "shortcutDetails": details}
+    assert "targetId" in download(env)["error"]
+    assert len(env.requests) == 1
+    assert_unchanged(env)
+
+
+@pytest.mark.parametrize("file_id", [None, 12, "", "../file", "file?alt=media", "https://example.com", "file\n"])
+def test_invalid_file_ids_are_rejected_without_io(env, file_id):
+    result = json.loads(asyncio.run(drive._handle_download_drive_file(USER, "conv", file_id)))
+    assert "file_id" in result["error"]
+    assert env.requests == []
+    env.loader.assert_not_awaited()
+    assert_unchanged(env)
+
+
+@pytest.mark.parametrize("self_reference", [False, True])
+def test_shortcut_cycles_stop_without_repeating_requests(env, self_reference):
+    env.metadata = shortcut("file1" if self_reference else "target1")
+    env.metadata_by_id["target1"] = shortcut("file1")
+    assert "cycle" in download(env)["error"]
+    assert len(env.requests) == (1 if self_reference else 2)
+    assert_unchanged(env)
+
+
+def test_shortcut_resolution_has_bounded_metadata_requests(env):
+    env.metadata = shortcut("target1")
+    for i in range(1, drive._MAX_DRIVE_SHORTCUT_HOPS + 1):
+        env.metadata_by_id[f"target{i}"] = shortcut(f"target{i + 1}")
+    assert "resolution limit" in download(env)["error"]
+    assert len(env.requests) == drive._MAX_DRIVE_SHORTCUT_HOPS + 1
+    assert_unchanged(env)
+
+
+def test_target_at_hop_limit_still_downloads(env):
+    env.metadata = shortcut("target1")
+    for i in range(1, drive._MAX_DRIVE_SHORTCUT_HOPS):
+        env.metadata_by_id[f"target{i}"] = shortcut(f"target{i + 1}")
+    env.metadata_by_id[f"target{drive._MAX_DRIVE_SHORTCUT_HOPS}"] = {
+        "name": "last.pdf", "mimeType": "application/pdf", "size": "5",
+    }
+    assert download(env)["status"] == "success"
+    assert (env.workspace / "last.pdf").read_bytes() == b"hello"
+    assert len(env.requests) == drive._MAX_DRIVE_SHORTCUT_HOPS + 2
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_broken_or_inaccessible_target_returns_actionable_error(env, status):
+    setup_shortcut(env, {"error": {"message": "Target unavailable"}})
+    env.metadata_status_by_id["target1"] = status
+    result = download(env)
+    assert "shortcut target metadata" in result["error"]
+    assert "Target unavailable" in result["error"]
+    assert "connected Google account" in result["hint"]
+    assert len(env.requests) == 2
+    assert_unchanged(env)
+
+
+@pytest.mark.parametrize("metadata", [None, [], "invalid", {"mimeType": 42}, {"size": "bad"}])
+def test_malformed_target_metadata_is_rejected_before_media(env, metadata):
+    setup_shortcut(env)
+    env.metadata_by_id["target1"] = metadata
+    assert "error" in download(env)
+    assert len(env.requests) == 2
     assert_unchanged(env)
