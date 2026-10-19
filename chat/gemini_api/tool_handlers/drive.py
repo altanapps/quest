@@ -5,6 +5,7 @@ export tools (google_export_doc / google_export_sheet / google_export_slides).
 import json
 import urllib.parse
 
+from chat.action_request_types._io_attachments import _ATTACHMENT_MAX_SIZE_BYTES
 from chat.gemini_api.tool_handlers._common import (
     conversation_workspace_dir,
     _publish_file_list_changed,
@@ -25,9 +26,10 @@ async def _handle_download_drive_file(
 ) -> str:
     """Download a Google Drive file to the conversation workspace.
 
-    Fetches file metadata (to determine the filename) and then downloads
-    the binary content using alt=media.  The file is saved to the
-    workspace so the LLM can read it with get_workspace_file.
+    Checks metadata against the attachment upload size cap, even with a
+    filename override, then streams alt=media with the same byte limit.
+    The file is atomically saved to the workspace so the LLM can read it
+    with get_workspace_file.
 
     Args:
         user: Authenticated user dict (for Google credentials).
@@ -46,48 +48,35 @@ async def _handle_download_drive_file(
 
     DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
 
-    # --- Step 1: Get file metadata to determine filename if not provided ---
+    # --- Step 1: Always preflight, including filename overrides ----------
+    metadata_url = (
+        f"{DRIVE_API_BASE}/files/{file_id}"
+        "?fields=name,mimeType,size&supportsAllDrives=true"
+    )
+    metadata_result = await _make_authed_request(
+        metadata_url, user=user, raw_response=False,
+    )
+    try:
+        metadata = json.loads(metadata_result)
+    except (json.JSONDecodeError, TypeError):
+        return json.dumps({"error": f"Failed to parse Drive metadata: {metadata_result}"})
+    if not isinstance(metadata, dict):
+        return json.dumps({"error": "Unexpected Drive metadata response."})
+    if "error" in metadata:
+        return json.dumps({"error": f"Failed to get file metadata: {metadata.get('error')}"})
+
+    size = metadata.get("size")
+    if size is not None:
+        if not str(size).isascii() or not str(size).isdigit():
+            return json.dumps({"error": "Invalid file size in Drive metadata."})
+        if int(size) > _ATTACHMENT_MAX_SIZE_BYTES:
+            return json.dumps({
+                "error": f"File exceeds the {_ATTACHMENT_MAX_SIZE_BYTES}-byte download size limit.",
+            })
     if not filename:
-        metadata_url = (
-            f"{DRIVE_API_BASE}/files/{file_id}"
-            "?fields=name,mimeType&supportsAllDrives=true"
-        )
-        metadata_result = await _make_authed_request(
-            metadata_url, user=user, raw_response=False,
-        )
-        # metadata_result is a JSON string on success or error
-        try:
-            metadata = json.loads(metadata_result)
-        except (json.JSONDecodeError, TypeError):
-            return json.dumps({"error": f"Failed to parse Drive metadata: {metadata_result}"})
-
-        if "error" in metadata:
-            return json.dumps({"error": f"Failed to get file metadata: {metadata.get('error')}"})
-
         filename = metadata.get("name", f"drive_file_{file_id}")
 
-    # --- Step 2: Download binary content with alt=media ---
-    download_url = (
-        f"{DRIVE_API_BASE}/files/{file_id}"
-        "?alt=media&supportsAllDrives=true"
-    )
-    download_result = await _make_authed_request(
-        download_url, user=user, raw_response=True,
-    )
-
-    # If we got a string back, it's an error
-    if isinstance(download_result, str):
-        try:
-            err = json.loads(download_result)
-        except (json.JSONDecodeError, TypeError):
-            err = download_result
-        return json.dumps({"error": f"Failed to download file: {err}"})
-
-    # download_result is an httpx.Response with binary content
-    file_bytes = download_result.content
-    content_type = download_result.headers.get("content-type", "application/octet-stream")
-
-    # --- Step 3: Save to workspace ---
+    # --- Step 2: Resolve the destination before downloading -------------
     workspace_dir = await conversation_workspace_dir(conversation_id)
 
     # Sanitize filename: strip path separators to prevent traversal
@@ -103,20 +92,33 @@ async def _handle_download_drive_file(
     except ValueError:
         return json.dumps({"error": "Invalid filename: results in path outside workspace"})
 
-    try:
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_bytes(file_bytes)
-    except Exception as e:
-        return json.dumps({"error": f"Failed to save file to workspace: {e}"})
+    # --- Step 3: Bounded streaming and atomic save -----------------------
+    download_url = (
+        f"{DRIVE_API_BASE}/files/{file_id}"
+        "?alt=media&supportsAllDrives=true"
+    )
+    download_result = await _make_authed_request(
+        download_url, user=user, raw_response=True,
+        download_to=file_path, max_download_bytes=_ATTACHMENT_MAX_SIZE_BYTES,
+    )
+    if isinstance(download_result, str):
+        try:
+            err = json.loads(download_result)
+        except (json.JSONDecodeError, TypeError):
+            err = download_result
+        return json.dumps({"error": f"Failed to download file: {err}"})
+
+    size_bytes = file_path.stat().st_size
+    content_type = download_result.headers.get("content-type", "application/octet-stream")
 
     _publish_file_list_changed(user["id"], "conversation", conversation_id, project_id)
     return json.dumps({
         "status": "success",
         "filename": clean_filename,
-        "size_bytes": len(file_bytes),
+        "size_bytes": size_bytes,
         "content_type": content_type,
         "message": (
-            f"File '{clean_filename}' ({len(file_bytes)} bytes) has been saved to the workspace. "
+            f"File '{clean_filename}' ({size_bytes} bytes) has been saved to the workspace. "
             f"Use get_workspace_file to read or analyze it: "
             f'tool_call(tool_name="get_workspace_file", arguments={{"path": "{clean_filename}"}})'
         ),

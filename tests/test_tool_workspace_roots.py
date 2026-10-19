@@ -81,10 +81,16 @@ async def _authed_get_output_file(env):
 
 async def _download_drive_file(env):
     from chat.gemini_api.tool_handlers import _handle_download_drive_file
-    replies = [json.dumps({"name": "sheet.bin"}), _response(b"bytes")]
+
+    async def request(url, **kwargs):
+        if not kwargs.get("raw_response"):
+            return json.dumps({"name": "sheet.bin", "size": "5"})
+        kwargs["download_to"].write_bytes(b"bytes")
+        return _response(b"")
+
     with patch(
         "chat.gemini_api.authed_get._make_authed_request",
-        new=AsyncMock(side_effect=replies),
+        new=AsyncMock(side_effect=request),
     ):
         out = json.loads(await _handle_download_drive_file(
             USER, CID, "FILE1", project_id=PID,
