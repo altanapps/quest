@@ -1,0 +1,51 @@
+import { test, expect, closeOnboarding, login } from './fixtures';
+
+test('open a seeded transcript from search and reload its deep link', async ({ page }) => {
+  await login(page, 'alice@quest.local');
+  await page.getByRole('button', { name: 'Search conversations', exact: true }).click();
+  await page.getByPlaceholder('Search conversations...').fill('testing in flight');
+  await expect(page.getByText('1 match found', { exact: true })).toBeVisible();
+  await page.getByText('Draft the weekly update from my notes: shipped run modes, testing in flight.', { exact: true }).click();
+  await expect(page).toHaveURL(/\/chats\/[^/]+$/);
+  await expect(page.getByText('Staging deploy automation not designed yet; mitigation: keep prod process unchanged until it is.', { exact: false })).toBeVisible();
+  const url = page.url();
+  await page.reload();
+  await closeOnboarding(page);
+  await expect(page).toHaveURL(url);
+  await expect(page.getByText('Staging deploy automation not designed yet; mitigation: keep prod process unchanged until it is.', { exact: false })).toBeVisible();
+});
+
+test('rename, archive, and restore a conversation with persisted sidebar state', async ({ signedIn: page }) => {
+  const created = await page.request.post('/app/api/conversations');
+  expect(created.ok()).toBeTruthy();
+  const { id } = await created.json() as { id: string };
+  await page.goto(`/chats/${id}`);
+  await closeOnboarding(page);
+  const title = 'E2E renamed conversation';
+  await page.getByRole('button', { name: 'New Chat', exact: true }).filter({ has: page.locator('.conversation-header-title') }).click();
+  await page.getByRole('menuitem', { name: /^Rename/ }).click();
+  await page.getByRole('textbox', { name: 'Rename conversation' }).fill(title);
+  const renamed = page.waitForResponse((response) => response.url().endsWith(`/conversations/${id}/rename`) && response.request().method() === 'PUT');
+  await page.getByRole('textbox', { name: 'Rename conversation' }).press('Enter');
+  expect((await renamed).ok()).toBeTruthy();
+  await page.reload();
+  await closeOnboarding(page);
+  const header = page.getByRole('button').and(page.getByTitle(title, { exact: true }));
+  await expect(header).toBeVisible();
+  await header.click();
+  const archived = page.waitForResponse((response) => response.url().endsWith(`/conversations/${id}/archive`));
+  await page.getByRole('menuitem', { name: /^Archive/ }).click();
+  expect((await archived).ok()).toBeTruthy();
+  const sidebar = page.locator('.sidebar-panel-main');
+  await expect(sidebar.getByText(title, { exact: true })).toHaveCount(0);
+  await sidebar.getByRole('button', { name: 'Conversation options' }).click();
+  await page.getByRole('checkbox', { name: 'Show Archived', exact: true }).check();
+  await expect(sidebar.getByText(title, { exact: true })).toBeVisible();
+  await header.click();
+  const restored = page.waitForResponse((response) => response.url().endsWith(`/conversations/${id}/unarchive`));
+  await page.getByRole('menuitem', { name: /^Unarchive/ }).click();
+  expect((await restored).ok()).toBeTruthy();
+  await page.reload();
+  await closeOnboarding(page);
+  await expect(sidebar.getByText(title, { exact: true })).toBeVisible();
+});

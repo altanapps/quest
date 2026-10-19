@@ -2,7 +2,7 @@
 
 ## Overview
 
-Development workflow for the Quest project: branching and PRs, syntax checking, the pytest test suite, and the frontend checks (typecheck, lint, unit tests, build).
+Development workflow for the Quest project: branching and PRs, pytest, frontend checks, and browser end-to-end testing.
 
 ## Branching & Pull Requests
 
@@ -11,7 +11,7 @@ All work lands on `main` through pull requests -- never commit directly to `main
 1. Branch from up-to-date `origin/main` (e.g. `feat/<topic>` or `fix/<topic>`).
 2. Develop and verify in local mode (`python3 run.py`; see [Run Modes](../architecture/run-modes.md)) and run the test suite before committing.
 3. Push the branch and open a PR against `main` (`gh pr create`).
-4. CI (`.github/workflows/ci.yml`) runs on every PR and push to `main`: the backend job runs `uv sync --locked` + `uv run pytest -q -n auto` (parallel, see "Pytest Test Suite"), the frontend job runs `npm ci`, `npm run typecheck`, `npm run lint`, `npm test` and `npm run build` on Node 24 (see "Frontend Checks"). Fix a red check before asking for review.
+4. CI (`.github/workflows/ci.yml`) runs on every PR and push to `main`: backend pytest, frontend checks, and Playwright browser tests run in separate jobs. Fix a red check before asking for review.
 5. A human reviews and merges. Agents open PRs; they do not merge them.
 
 ## Key Files
@@ -112,6 +112,16 @@ The realtime path has its own suites, each driving the exact envelopes the serve
 - `src/services/WebSocketManager.test.ts` -- send receipts: the `client_send_id` stamp on `send_message`, the 15 s `send_message_accepted` window, the `not_connected` / `unconfirmed` failed states with Retry / Discard, late receipts, `send_message_rejected` rollback and the `run_active` reconcile on `subscribed` acks.
 - `src/services/PersistentWebSocket.test.ts` -- reconnect / catchup at the socket level with a scripted fake `WebSocket` and fake timers: the per-conversation `last_seq` recorded from `message_appended` / `subscribed`, persisted to sessionStorage and re-sent on every `subscribe` after a drop, exponential backoff, the liveness watchdog and the discarded-socket guard.
 - `src/hooks/useConversation.test.tsx` -- what the hook does with the server's verdict: `catchup` rows inserted by seq with optimistic-bubble reconciliation, `resync` (ack mode or the server-pushed event) refetching the conversation, `message_appended` tail fetches deduped by seq.
+
+## Browser End-to-End Tests
+
+`frontend/e2e/` contains Playwright tests against the real FastAPI app and built frontend, separate from Vitest's jsdom suite. Configuration and browser projects live in `frontend/playwright.config.ts`; browser code is type-checked through `frontend/tsconfig.e2e.json`. Use Node 24, `uv sync --locked`, and `npm ci` in `frontend/`; install Chromium with `npx playwright install chromium` there (`--with-deps` on Linux).
+
+From `frontend/`, `npm run test:e2e` builds the app and runs the suite. Playwright arguments pass through, for example `npm run test:e2e -- --project=chromium` or `--headed`. `npm run test:e2e:report` opens the HTML report. CI installs the browser and uploads reports and failure traces/screenshots as the `playwright-results` artifact.
+
+The launcher (`frontend/e2e/server.py`) snapshots tracked source and non-ignored additions into a temporary runtime with its own database, files, configuration, and home directory. It excludes developer credentials and sanitizes the process environment, then runs real migrations and local seeding. It bypasses `run.py` to avoid shared dev-config imports and container builds; shutdown removes the runtime. Ignored source files are not staged. `QUEST_E2E_PORT` selects a dedicated loopback port (with its adjacent sandbox port); Playwright refuses to reuse an existing server.
+
+Mutation fixtures use unique accounts; seeded content supports transcript/search tests. The launcher's fixed per-user gates let enabled and denied Docs/Tables tests run concurrently without changing global settings. Tests exercise persistence through reloads and real API requests rather than intercepting them. They do not validate Google OAuth, live model generation, external connectors, or sandbox execution; those require a separate credentialed integration environment.
 
 ## Releases
 
