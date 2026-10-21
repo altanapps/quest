@@ -40,7 +40,9 @@ from chat.gemini_api.turn_tools import (
     _WAIT_FOR_HANDLES_MAX_IDS,
     TURN_TOOL_HANDLERS,
     FinishInferenceResponse,
+    REQUEST_SERVICE_CONNECTION_KEY,
     SuspendForActionRequest,
+    SuspendForServiceConnection,
     SuspendForSlackReply,
     SuspendForWaitHandles,
     ToolCall,
@@ -1117,6 +1119,40 @@ async def run_conversation_turn(
                         "tool_id": tool_id,
                         "extra_parts": [],
                     })
+                elif row is not None and row.get("kind") == "service_connection":
+                    # request_service_connection suspends: close with the
+                    # row's response from the connect-request resolve
+                    # endpoint ({"status": "connected"|"declined", ...}).
+                    # A row the WS stop handler cancelled (or the sweep
+                    # timed out) reads as cancelled so the model treats
+                    # the service as not connected.
+                    response = row.get("response") or {}
+                    payload_dict = row.get("payload") or {}
+                    if row.get("status") == ToolWaitHandleStatus.PENDING:
+                        result_str = json.dumps({
+                            "status": "still_waiting",
+                            "note": "User has not acted on the connect card yet.",
+                        })
+                    elif not response:
+                        result_str = json.dumps({
+                            "status": "cancelled",
+                            "service": payload_dict.get("service"),
+                            "note": (
+                                "The connect card was dismissed without a "
+                                "decision (the conversation was stopped). "
+                                "Treat the service as not connected; if the "
+                                "user sent a new message it follows in this "
+                                "turn."
+                            ),
+                        })
+                    else:
+                        result_str = json.dumps(response)
+                    tool_results_for_resume.append({
+                        "name": tool_name,
+                        "result": result_str,
+                        "tool_id": tool_id,
+                        "extra_parts": [],
+                    })
                 elif (
                     tool_name == "wait_for_handles"
                     or (tool_name == "tool_call"
@@ -1410,16 +1446,22 @@ async def run_conversation_turn(
                             ),
                             turn_state,
                         )
-                    except SuspendForActionRequest as suspend_exc:
-                        if registry_key != "create_action_request":
+                    except (
+                        SuspendForActionRequest, SuspendForServiceConnection,
+                    ) as suspend_exc:
+                        if registry_key not in (
+                            "create_action_request",
+                            REQUEST_SERVICE_CONNECTION_KEY,
+                        ):
                             # return_to_caller keeps its immediate unwind:
                             # a subagent run has exactly one return.
                             raise
                         # Card + wait handle are already durable (the arm
-                        # emitted the action_request event before raising).
-                        # No tool_result for this call -- the resume bucket
-                        # closes it with the row's verdict. Keep dispatching
-                        # the rest of the batch.
+                        # emitted the action_request / connect_request
+                        # event before raising). No tool_result for this
+                        # call -- the resume bucket closes it with the
+                        # row's verdict. Keep dispatching the rest of the
+                        # batch.
                         batch_suspends.append(suspend_exc)
                         continue
                     _log_large_tool_result(
@@ -1548,6 +1590,20 @@ async def run_conversation_turn(
             "sibling_handle_ids=%s, user=%s)",
             conversation_id, exc.tool_id, exc.handle_id,
             exc.request_id, exc.sibling_handle_ids, user["email"],
+        )
+        return structured_messages
+    except SuspendForServiceConnection as exc:
+        # Same shape as SuspendForActionRequest: the dangling
+        # request_service_connection tool_use is on disk and the resume
+        # bucket closes it once the connect-request resolve endpoint
+        # (chat/connect_request_routes.py) writes the service_connection
+        # wait-handle row.
+        logger.info(
+            "[wait-suspend] Conversation %s suspended on service_connection "
+            "(tool_id=%s, handle_id=%s, service=%s, "
+            "sibling_handle_ids=%s, user=%s)",
+            conversation_id, exc.tool_id, exc.handle_id,
+            exc.service, exc.sibling_handle_ids, user["email"],
         )
         return structured_messages
     except FinishInferenceResponse as exc:

@@ -354,11 +354,15 @@ _CORE_READ_OR_WORKSPACE_TOOLS = {
     # (and inference runs have no project anyway).
     "project_memory_search", "project_memory_list", "suggest_project_memory",
     "wait_for_handles",
+    "list_service_connections",  # read-only view of the Settings rows
     "download_drive_file", "google_export_doc",  # external read -> workspace
     "google_export_sheet", "google_export_slides",
     "list_gmail_quest_labels", "get_gmail_messages", "list_gmail_labels",
     "get_gmail_message_urls",
     "set_conversation_name",  # the run's own row
+    # Opens an inline connect card at the top level only; the arm refuses
+    # inference runs before any write.
+    "request_service_connection",
     "project_db_query",
     # Scheme-qualified file tools: project conversations only, never offered
     # to (standalone) inference runs; proj:// is refused without a project

@@ -636,6 +636,9 @@ Facts the user has saved about themselves and how they want you to work, newest 
         # currently see was create_action_request, which is now gated.
         top_level_exclude.add("wait_for_handles")
         top_level_exclude.add("create_action_request")
+        # The inline connect card is a web-app card too.
+        top_level_exclude.add("request_service_connection")
+        top_level_exclude.add("list_service_connections")
     if is_routine:
         # Routine conversations already carry the routine's name; the model
         # has nothing to name. A routine run is a canned task, not a
@@ -877,7 +880,11 @@ def get_user_subagent_system_prompt(
     # The run is a standalone conversation in the target's account, so the
     # project-only tools never apply.
     user_subagent_exclude = (
-        {"wait_for_handles", "set_conversation_name", "suggest_memory"}
+        {
+            "wait_for_handles", "request_service_connection",
+            "list_service_connections",
+            "set_conversation_name", "suggest_memory",
+        }
         | PROJECT_ONLY_TOOL_CALL_TOOLS
         | _doc_write_tool_names()
         | _table_write_tool_names()
@@ -982,7 +989,11 @@ def get_inference_api_system_prompt(
     # must not change anything. That covers the Quest Docs writes too.
     # Inference runs are standalone conversations: no project-only tools.
     inference_exclude = (
-        {"wait_for_handles", "set_conversation_name", "suggest_memory"}
+        {
+            "wait_for_handles", "request_service_connection",
+            "list_service_connections",
+            "set_conversation_name", "suggest_memory",
+        }
         | PROJECT_ONLY_TOOL_CALL_TOOLS
         | mutating_tool_call_tools()
     )
@@ -1352,8 +1363,9 @@ def get_sub_agent_system_prompt(
     # top-level agent writes docs"), so the doc and table write tools are
     # hidden too.
     sub_agent_exclude = {
-        "wait_for_handles", "set_conversation_name", "suggest_memory",
-        "suggest_project_memory",
+        "wait_for_handles", "request_service_connection",
+        "list_service_connections",
+        "set_conversation_name", "suggest_memory", "suggest_project_memory",
     }
     sub_agent_exclude |= _doc_write_tool_names() | _table_write_tool_names()
     if has_project:
