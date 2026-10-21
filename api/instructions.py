@@ -17,9 +17,12 @@ from api.slides import get_instructions as slides_instructions
 from api.tasks import get_instructions as tasks_instructions
 from api.airtable import get_instructions as airtable_instructions
 from api.ramp import get_instructions as ramp_instructions
+from chat.browser_sessions import BROWSER_SERVICE_KEY
 from chat.docs.constants import DOCS_SERVICE_KEY
 from chat.tables.constants import TABLES_SERVICE_KEY
-from config.feature_gates import docs_enabled_for, tables_enabled_for
+from config.feature_gates import (
+    browser_enabled_for, docs_enabled_for, tables_enabled_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +31,9 @@ logger = logging.getLogger(__name__)
 # (``SystemSkill.requires``) like a connected service does, but nothing is
 # "connected" -- so aggregates such as GET /me's has_any_service_connected
 # must skip them.
-PSEUDO_SERVICE_KEYS = frozenset({DOCS_SERVICE_KEY, TABLES_SERVICE_KEY})
+PSEUDO_SERVICE_KEYS = frozenset({
+    DOCS_SERVICE_KEY, TABLES_SERVICE_KEY, BROWSER_SERVICE_KEY,
+})
 
 
 def get_user_connected_services(user: dict) -> dict[str, bool]:
@@ -104,7 +109,27 @@ def get_user_connected_services(user: dict) -> dict[str, bool]:
     email = user.get("email") or ""
     services[DOCS_SERVICE_KEY] = docs_enabled_for(email)
     services[TABLES_SERVICE_KEY] = tables_enabled_for(email)
+    # The browser tools exist for public projects only; their specs are
+    # gated on this key so the regular prompts, which never carry a
+    # public conversation, never advertise them. The public prompt takes
+    # the gate directly (get_public_project_system_prompt browser_enabled).
+    services[BROWSER_SERVICE_KEY] = False
     return services
+
+
+def get_public_connected_services(user: dict) -> dict[str, bool]:
+    """The connected-services map of a PUBLIC-project conversation: no
+    connector is ever connected there, only the feature-gate pseudo-keys
+    are set. It gates the public system skills (``PUBLIC_SYSTEM_SKILLS``
+    in ``chat/llm/tool_schemas.py``) in the public prompt's enumeration
+    and in the public ``load_skills`` arm; the public prompt's tool
+    sections take the same gates as explicit flags."""
+    email = user.get("email") or ""
+    return {
+        DOCS_SERVICE_KEY: docs_enabled_for(email),
+        TABLES_SERVICE_KEY: tables_enabled_for(email),
+        BROWSER_SERVICE_KEY: browser_enabled_for(email),
+    }
 
 
 def _preamble_instructions(base_url: str, api_key: str, connected_services: dict[str, bool] | None = None) -> str:

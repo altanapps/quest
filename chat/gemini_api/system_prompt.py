@@ -25,6 +25,7 @@ from chat.llm.tool_schemas import (
     tool_is_advertised,
 )
 from chat.system_skills import build_system_skills_enumeration
+from chat.browser_sessions import BROWSER_SERVICE_KEY
 
 
 def _doc_tool_names() -> frozenset[str]:
@@ -33,6 +34,16 @@ def _doc_tool_names() -> frozenset[str]:
     return frozenset(
         name for name, spec in TOOL_CALL_REGISTRY.items()
         if spec.get("requires_service") == DOCS_SERVICE_KEY
+    )
+
+
+def _browser_tool_names() -> frozenset[str]:
+    """The browser tools: the registry specs gated on the ``browser``
+    pseudo-key (``requires_service == BROWSER_SERVICE_KEY``); public
+    projects only, documented by the ``system:browser`` skill."""
+    return frozenset(
+        name for name, spec in TOOL_CALL_REGISTRY.items()
+        if spec.get("requires_service") == BROWSER_SERVICE_KEY
     )
 
 
@@ -1055,6 +1066,7 @@ def get_public_project_system_prompt(
     is_routine: bool = False,
     docs_enabled: bool = False,
     tables_enabled: bool = False,
+    browser_enabled: bool = False,
     legacy_shared_workspace: bool = False,
     converted_from_standalone: bool = False,
 ) -> str:
@@ -1092,6 +1104,16 @@ def get_public_project_system_prompt(
     Tables" paragraph is omitted; while True both are present (the
     paragraph stands in for the ``system:tables`` skill).
 
+    ``browser_enabled`` is the same switch for the browser gate
+    (``config.feature_gates.browser_enabled_for``). The browser tools are
+    never inlined: they are documented by the ``system:browser`` skill,
+    one of the public system skills (``PUBLIC_SYSTEM_SKILLS``). While
+    True the prompt carries a System Skills block naming that skill and
+    its tools plus the ``load_skills`` tool; while False (or with every
+    public skill gated off) neither appears and the prompt is the
+    four-tool one. The browser exists for public projects only, so no
+    other prompt builder has such a switch.
+
     A public-project conversation is always a project conversation, so the
     "Two file spaces" paragraph (conversation workspace at ``/workspace``,
     project workspace at ``/project``) is always present, and
@@ -1099,7 +1121,7 @@ def get_public_project_system_prompt(
     conversation's notice flags) add their notes as in get_system_prompt().
     """
     from chat.llm.tool_schemas import (
-        TOOL_CALL_REGISTRY, PUBLIC_TOOL_CALL_ALLOWLIST,
+        TOOL_CALL_REGISTRY, PUBLIC_TOOL_CALL_ALLOWLIST, PUBLIC_SYSTEM_SKILLS,
     )
 
     identity_line = ""
@@ -1151,12 +1173,39 @@ def get_public_project_system_prompt(
         public_exclude |= _doc_tool_names()
     if not tables_enabled:
         public_exclude |= _table_tool_names()
-    # No skill tools here, so every offered tool is documented in full.
+    # The browser tools are skill-documented (system:browser): named on
+    # the public System Skills block below, never inlined here.
+    public_exclude |= _browser_tool_names()
+    # Every inlined tool is documented in full (the public prompt has no
+    # core tier); the skill-documented ones are the public system skills'.
     dynamic_tools_section = _build_dynamic_tools_section(
         exclude=public_exclude, core_only=False,
     )
     docs_section = _PUBLIC_DOCS_SECTION if docs_enabled else ""
     tables_section = _PUBLIC_TABLES_SECTION if tables_enabled else ""
+
+    # Public system skills (PUBLIC_SYSTEM_SKILLS, gated like any other
+    # skill through the public connected-services map): the one place a
+    # public prompt names a skill. Empty while every public skill is
+    # gated off, and then load_skills is left out of the tool list too.
+    public_services = {BROWSER_SERVICE_KEY: browser_enabled}
+    skills_exclude = set(public_exclude) - _browser_tool_names() if browser_enabled else set(public_exclude)
+    public_skills_block = build_system_skills_enumeration(
+        public_services, has_project=True, exclude_tools=skills_exclude,
+        include_only=PUBLIC_SYSTEM_SKILLS,
+    )
+    if public_skills_block:
+        tools_intro = "You have five tools available:"
+        load_skills_line = (
+            "\n5. **load_skills(skill_ids)** -- Load one or more of the built-in "
+            "system skills listed in the 'System Skills' section below; they "
+            "are the only skills in a public project (no user skills). Load a "
+            "skill before calling the tools its line names."
+        )
+        public_skills_block = "\n" + public_skills_block + "\n"
+    else:
+        tools_intro = "You have four tools available:"
+        load_skills_line = ""
 
     if is_routine:
         naming_section = _ROUTINE_NAMING_SECTION
@@ -1188,15 +1237,15 @@ User Local Time: <current local datetime> (<timezone>)
 
 Use the time information to answer time-sensitive questions correctly without needing to call `get_current_time()` for simple cases. Do not repeat or quote the XML tags back to the user unless specifically asked.
 
-You have four tools available:
+{tools_intro}
 
 1. **tool_call(tool_name, arguments?)** -- Execute a tool by name. See the 'Dynamic Tools' section below for available tools and their parameters.
 2. **run_script(path, args?, timeout?)** -- Run a script from the workspace inside a sandboxed container with Python 3.12 and **internet access**. Returns stdout, stderr, exit code. Default timeout is {SCRIPT_RUNNER_TIMEOUT} seconds (max {SCRIPT_RUNNER_MAX_TIMEOUT}).
 3. **run_python(script, args?, timeout?)** -- Run inline Python in the same internet-enabled sandboxed container. For one-off tasks (no file written).
-4. **create_action_request(request_type, params, reasoning)** -- Propose a change to one of this project's docs or tables that needs the user's approval (the only request types here are `write_doc`, `create_table`, `change_table_schema` and `write_table_rows`; the docs and tables paragraphs below, present while each feature is enabled, say when to use each). The card shows Approve / Revise / Stop buttons and nothing is written until the user approves. This call BLOCKS until they resolve it; the return value carries the verdict (`executed`, `denied` with optional revise `feedback`, or `stopped`, which halts the conversation until the user's next message) so you continue on the same turn. Several independent requests may be issued in one response, each on its own card.
+4. **create_action_request(request_type, params, reasoning)** -- Propose a change to one of this project's docs or tables that needs the user's approval (the only request types here are `write_doc`, `create_table`, `change_table_schema` and `write_table_rows`; the docs and tables paragraphs below, present while each feature is enabled, say when to use each). The card shows Approve / Revise / Stop buttons and nothing is written until the user approves. This call BLOCKS until they resolve it; the return value carries the verdict (`executed`, `denied` with optional revise `feedback`, or `stopped`, which halts the conversation until the user's next message) so you continue on the same turn. Several independent requests may be issued in one response, each on its own card.{load_skills_line}
 
 {dynamic_tools_section}
-
+{public_skills_block}
 **The sandbox (run_script / run_python):**
 - Has open internet access: fetch public URLs and APIs with `requests` / `httpx` / `curl` / `wget`. Pre-installed Python packages include requests, httpx, beautifulsoup4, lxml, openpyxl, python-docx, matplotlib, seaborn, and pypdf.
 - Private network destinations (LAN addresses, cloud metadata) are blocked; only the public internet is reachable.
