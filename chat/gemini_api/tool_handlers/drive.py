@@ -3,6 +3,7 @@ export tools (google_export_doc / google_export_sheet / google_export_slides).
 """
 
 import json
+import re
 import urllib.parse
 
 from chat.action_request_types._io_attachments import _ATTACHMENT_MAX_SIZE_BYTES
@@ -16,6 +17,10 @@ from chat.gemini_api.tool_handlers._common import (
 # ---------------------------------------------------------------------------
 # Drive file download handler
 # ---------------------------------------------------------------------------
+_GOOGLE_SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
+_GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
+_MAX_DRIVE_SHORTCUT_HOPS = 5
+
 
 async def _handle_download_drive_file(
     user: dict,
@@ -30,13 +35,15 @@ async def _handle_download_drive_file(
     filename override, then streams alt=media with the same byte limit.
     The file is atomically saved to the workspace so the LLM can read it
     with get_workspace_file.
+    Shortcuts are resolved using fresh target metadata; folders and native
+    Workspace files return guidance instead of attempting alt=media.
 
     Args:
         user: Authenticated user dict (for Google credentials).
         conversation_id: Conversation UUID.
-        file_id: Google Drive file ID.
+        file_id: Google Drive file or shortcut ID.
         filename: Optional filename override.  When None, the original
-            filename from Drive metadata is used.
+            filename from the resolved target's Drive metadata is used.
         project_id: Carried on the file_list_changed event only; the file
             always lands in the conversation workspace.
 
@@ -47,23 +54,58 @@ async def _handle_download_drive_file(
     from chat.gemini_api.authed_get import _make_authed_request
 
     DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
+    if not isinstance(file_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", file_id):
+        return json.dumps({"error": "file_id must be a non-empty Google Drive file ID, not a URL or path."})
 
     # --- Step 1: Always preflight, including filename overrides ----------
-    metadata_url = (
-        f"{DRIVE_API_BASE}/files/{file_id}"
-        "?fields=name,mimeType,size&supportsAllDrives=true"
-    )
-    metadata_result = await _make_authed_request(
-        metadata_url, user=user, raw_response=False,
-    )
-    try:
-        metadata = json.loads(metadata_result)
-    except (json.JSONDecodeError, TypeError):
-        return json.dumps({"error": f"Failed to parse Drive metadata: {metadata_result}"})
-    if not isinstance(metadata, dict):
-        return json.dumps({"error": "Unexpected Drive metadata response."})
-    if "error" in metadata:
-        return json.dumps({"error": f"Failed to get file metadata: {metadata.get('error')}"})
+    visited = set()
+    for hop in range(_MAX_DRIVE_SHORTCUT_HOPS + 1):
+        if file_id in visited:
+            return json.dumps({"error": "Drive shortcut cycle detected. Check the shortcut's target in Drive."})
+        visited.add(file_id)
+        metadata_url = (
+            f"{DRIVE_API_BASE}/files/{file_id}"
+            "?fields=name,mimeType,size,shortcutDetails(targetId)&supportsAllDrives=true"
+        )
+        metadata_result = await _make_authed_request(
+            metadata_url, user=user, raw_response=False,
+        )
+        try:
+            metadata = json.loads(metadata_result)
+        except (json.JSONDecodeError, TypeError):
+            return json.dumps({"error": f"Failed to parse Drive metadata: {metadata_result}"})
+        if not isinstance(metadata, dict):
+            return json.dumps({"error": "Unexpected Drive metadata response."})
+        if "error" in metadata:
+            if hop:
+                return json.dumps({
+                    "error": f"Failed to get Drive shortcut target metadata: {metadata.get('error')}",
+                    "hint": (
+                        "The target may have been deleted or may not be accessible to "
+                        "your connected Google account. Open the target in Drive, "
+                        "check access, then retry."
+                    ),
+                })
+            return json.dumps({"error": f"Failed to get file metadata: {metadata.get('error')}"})
+
+        source_mime = metadata.get("mimeType", "")
+        if not isinstance(source_mime, str):
+            return json.dumps({"error": "Invalid MIME type in Drive metadata."})
+        if source_mime != _GOOGLE_SHORTCUT_MIME:
+            break
+        details = metadata.get("shortcutDetails")
+        target_id = details.get("targetId") if isinstance(details, dict) else None
+        if not isinstance(target_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", target_id):
+            return json.dumps({
+                "error": "Drive shortcut has no valid shortcutDetails.targetId. Check the shortcut in Drive.",
+            })
+        if hop == _MAX_DRIVE_SHORTCUT_HOPS:
+            return json.dumps({"error": "Drive shortcut resolution limit reached. Use the final target's file ID directly."})
+        file_id = target_id
+
+    type_error = _drive_download_type_error(source_mime, file_id)
+    if type_error is not None:
+        return json.dumps(type_error)
 
     size = metadata.get("size")
     if size is not None:
@@ -271,6 +313,40 @@ _EXPORT_KINDS: dict[str, dict] = {
 _EXPORT_TOOL_BY_MIME: dict[str, str] = {
     spec["mime"]: spec["tool"] for spec in _EXPORT_KINDS.values()
 }
+
+
+def _drive_download_type_error(source_mime: str, file_id: str) -> dict | None:
+    """Steer downloads of non-binary types without fetching media or exporting."""
+    for spec in _EXPORT_KINDS.values():
+        if source_mime == spec["mime"]:
+            arguments = json.dumps({spec["id_param"]: file_id, "format": "pdf"})
+            return {
+                "error": f"Native {spec['label']} files have no binary content to download.",
+                "hint": (
+                    f"Use {spec['tool']} to export it to the workspace instead: "
+                    f"tool_call(tool_name=\"{spec['tool']}\", arguments={arguments})."
+                ),
+            }
+    if source_mime == _GOOGLE_FOLDER_MIME:
+        query = urllib.parse.urlencode({
+            "q": f"'{file_id}' in parents and trashed = false",
+            "fields": "files(id,name,mimeType),nextPageToken",
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+        })
+        return {
+            "error": "Google Drive folders have no binary content to download.",
+            "hint": (
+                "Use authed_get to list the folder's contents, then download individual files: "
+                f"https://www.googleapis.com/drive/v3/files?{query}"
+            ),
+        }
+    if source_mime.startswith("application/vnd.google-apps."):
+        return {
+            "error": f"Google Workspace type '{source_mime}' is not supported by download_drive_file.",
+            "hint": "Open the file in its native application to find its available export options.",
+        }
+    return None
 
 
 def _wrong_kind_hint(kind: str, source_mime: str, file_id: str) -> str:
