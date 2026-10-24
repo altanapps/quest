@@ -112,6 +112,14 @@ subagent badge. It is read-only end to end: the FE composer disables for
 project conversion is rejected (`chat/project_routes.py`). The pending
 `subagent_return` card is the only interaction point.
 
+The tool dispatcher refuses every dynamic tool marked `mutating`, including
+connector tools registered by plugins, and the state-changing internal proxy
+routes. Script and Python execution carry the same restriction in their sandbox
+lease: both the script tool-call bridge and direct mutating HTTP routes reject
+these operations. The prompt omits mutating tools as well. The subagent can
+still read connected services and write files in its own workspace for an
+approved return; it cannot change the target's connected-service state.
+
 ## Files
 
 - `chat/user_subagent.py` — runtime (launch/resume/nudge/finalize; module

@@ -64,7 +64,7 @@ class SandboxLease:
     # a token, so is_public is False on every lease a script can present.
     project_id: str | None = None
     is_public: bool = False
-    # Set for containers launched from a one-shot inference API run: the
+    # Set for containers launched from inference or cross-user subagent runs: the
     # sandbox tool API then refuses the mutating dynamic tools on the
     # POST /api/tool-call bridge and the mutating HTTP routes (both from
     # chat.llm.tool_schemas), so a script cannot do what the run's own
@@ -209,7 +209,7 @@ async def get_current_sandbox_user(request: Request) -> dict:
                     "message": (
                         f"'{request.url.path}' is not available from this "
                         "container: it changes external state and the "
-                        "launching inference API run is read-only."
+                        "launching run is read-only."
                     ),
                 },
             )

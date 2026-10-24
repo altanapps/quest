@@ -191,6 +191,12 @@ class ToolContext:
     is_script: bool = False
 
     @property
+    def block_mutating_tools(self) -> bool:
+        """Runs that must not change connected-service state, including
+        when they delegate work to a sub-agent or sandbox."""
+        return self.is_inference_api or self.is_user_subagent
+
+    @property
     def run_kind(self) -> str:
         """The ``chat.docs.access.RUN_KINDS`` value for this call.
 
@@ -613,7 +619,7 @@ async def _tool_run_script(ctx: ToolContext, args: dict) -> str:
         args=args.get("args", ""), timeout=_script_timeout(args),
         project_id=ctx.project_id,
         public=ctx.is_public,
-        block_mutating_tools=ctx.is_inference_api,
+        block_mutating_tools=ctx.block_mutating_tools,
     )
 
 
@@ -623,7 +629,7 @@ async def _tool_run_python(ctx: ToolContext, args: dict) -> str:
         args=args.get("args", ""), timeout=_script_timeout(args),
         project_id=ctx.project_id,
         public=ctx.is_public,
-        block_mutating_tools=ctx.is_inference_api,
+        block_mutating_tools=ctx.block_mutating_tools,
     )
 
 
@@ -943,7 +949,8 @@ async def _dispatch_tool_call(
             mutating internal proxy paths are hard-rejected, and sandbox
             containers get a lease that refuses them on the bridge too.
         is_user_subagent: Whether the conversation is a cross-user
-            subagent run (origin="user_subagent").
+            subagent run (origin="user_subagent"). Uses the same mutation
+            restrictions as inference runs, including proxy and sandbox calls.
         is_slack: Whether the conversation is Slack-driven (origin="slack").
         is_script: Whether the call comes from a sandbox script through the
             POST /api/tool-call bridge. Together with is_sub_agent and
@@ -1052,20 +1059,18 @@ async def _dispatch_tool_call_inner(
                 ),
             }), []
 
-    # Inference-run enforcement. Inference API calls must not change
-    # anything: the mutating dynamic tools run without an approval card
-    # (there is nobody to approve one), so they are refused here regardless
-    # of what the prompt advertised. Workspace writes stay allowed -- the
-    # run's conversation owns a fresh workspace. Mutating proxy paths are
-    # refused by execute_tool_call (block_mutating) below.
-    if is_inference_api and tool_name == "tool_call":
+    # Inference and cross-user runs cannot approve connected-service writes.
+    # Enforce this regardless of the prompt, and propagate it to proxy and
+    # sandbox calls below. Writes to the run's own workspace stay allowed.
+    if ctx.block_mutating_tools and tool_name == "tool_call":
         from chat.llm.tool_schemas import mutating_tool_call_tools
         requested = args.get("tool_name", "")
         if requested and requested in mutating_tool_call_tools():
+            run_label = "cross-user subagent" if is_user_subagent else "inference API"
             return json.dumps({
                 "error": (
-                    f"Tool '{requested}' is not available in inference API "
-                    "runs: it changes external state and inference runs "
+                    f"Tool '{requested}' is not available in {run_label} "
+                    "runs: it changes external state and these runs "
                     "are read-only. Report what the caller should do "
                     "instead in the final response."
                 ),
@@ -1116,7 +1121,7 @@ async def _dispatch_tool_call_inner(
         # HTTP tools (curl_proxy_get, curl_proxy_post) via route dispatch
         result, notices = await execute_tool_call(
             app, user, tool_name, args, conversation_id=conversation_id,
-            block_mutating=is_inference_api,
+            block_mutating=ctx.block_mutating_tools,
         )
         for notice in notices:
             extra_parts.append(provider.make_text_part(notice))

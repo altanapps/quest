@@ -483,10 +483,13 @@ class TestInferenceDispatchRejectsMutations:
     def test_sandbox_launch_carries_the_restriction(self):
         """run_script / run_python from an inference run mint a lease whose
         block_mutating_tools flag the sandbox tool API enforces."""
-        import inspect
+        from unittest.mock import AsyncMock, patch
         from chat.gemini_api import tool_dispatch
-        for wrapper in (tool_dispatch._tool_run_script, tool_dispatch._tool_run_python):
-            assert "block_mutating_tools=ctx.is_inference_api" in inspect.getsource(wrapper)
+        for name in ("run_script", "run_python"):
+            runner = AsyncMock(return_value='{"ok": true}')
+            with patch.object(tool_dispatch, "_handle_" + name, runner):
+                self._dispatch(name, {"path": "test.py", "script": "pass"})
+            assert runner.await_args.kwargs["block_mutating_tools"] is True
 
 
 def test_inference_prompt_hides_mutating_tools_and_states_the_boundary(slack_plugin):

@@ -447,7 +447,11 @@ class TestTiers:
             ("append_to_doc", {"doc_id": doc["id"], "content": "x"}),
             ("create_doc", {"title": "T", "content": "x"}),
         ):
-            assert _dispatch(docs_env, tool, args, **flags) == {"error": reason}
+            result = _dispatch(docs_env, tool, args, **flags)
+            if flags.get("is_user_subagent"):
+                assert "not available in cross-user subagent runs" in result["error"]
+            else:
+                assert result == {"error": reason}
         assert body(doc["id"]) == "t\n"
 
     def test_slack_dispatch(self, docs_env):

@@ -902,9 +902,8 @@ def get_user_subagent_system_prompt(
 
 """
 
-    # Cross-user subagent runs are read-only for Quest Docs and Tables
-    # (access rule run_kind "user_subagent"): the reads stay, the writes
-    # are hidden.
+    # Cross-user runs cannot mutate connected services or Quest artifacts.
+    # Dispatch enforces the boundary; the prompt advertises only reads.
     # The run is a standalone conversation in the target's account, so the
     # project-only tools never apply.
     user_subagent_exclude = (
@@ -914,8 +913,7 @@ def get_user_subagent_system_prompt(
             "set_conversation_name", "suggest_memory",
         }
         | PROJECT_ONLY_TOOL_CALL_TOOLS
-        | _doc_write_tool_names()
-        | _table_write_tool_names()
+        | mutating_tool_call_tools()
     )
     dynamic_tools = _build_dynamic_tools_section(
         exclude=user_subagent_exclude, connected_services=connected_services,
