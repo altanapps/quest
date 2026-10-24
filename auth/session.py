@@ -75,8 +75,10 @@ def _load_session_payload(signed_cookie: str) -> Optional[dict]:
     return payload
 
 
-async def get_user_from_cookie(signed_cookie: str) -> Optional[dict]:
-    """Deserialize a session cookie and return the user dict.
+async def get_user_from_cookie(
+    signed_cookie: str, *, require_admission: bool = True,
+) -> Optional[dict]:
+    """Validate a session cookie and enforce the current admission policy.
 
     Only accepts cookies that verify under the timed session serializer
     within their lifetime (``session_max_age()``), match the current
@@ -85,6 +87,10 @@ async def get_user_from_cookie(signed_cookie: str) -> Optional[dict]:
     mismatches, boolean uid / epoch values (bool is a subclass of int in
     Python), and non-positive IDs. Cookies signed without a timestamp
     (the pre-timed format) fail verification.
+
+    A valid but offboarded identity raises 403, including on routes that
+    resolve cookies directly. Only sign-out and restoration of an admitted
+    impersonator may opt out with ``require_admission=False``.
     """
     if not signed_cookie:
         return None
@@ -152,12 +158,14 @@ async def get_user_from_cookie(signed_cookie: str) -> Optional[dict]:
         if not check_is_admin(impersonator["email"]):
             # Admin access revoked -- invalidate impersonation session
             return None
+        if require_admission:
+            _require_allowed(impersonator)
         user["_impersonator_uid"] = imp_uid
         user["_impersonator_email"] = impersonator["email"]
         user["_impersonator_name"] = impersonator.get("name", "")
         _audit_impersonated_request(user)
 
-    return user
+    return _require_allowed(user) if require_admission else user
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +360,11 @@ async def revoke_cookie_session(request: Request) -> None:
     """Sign-out: revoke the sessions of the account behind the request's
     session cookie. A missing or invalid cookie revokes nothing."""
     signed_cookie = request.cookies.get(COOKIE_NAME)
-    user = await get_user_from_cookie(signed_cookie) if signed_cookie else None
+    # An offboarded user must still be able to revoke their own sessions.
+    user = (
+        await get_user_from_cookie(signed_cookie, require_admission=False)
+        if signed_cookie else None
+    )
     if user is not None:
         await revoke_sessions(user)
 

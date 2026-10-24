@@ -199,7 +199,11 @@ Failure handling: a missing user row (deleted account) rejects the send with `{t
 
 ## Heartbeat and Auth
 
-The server runs a ping / pong-deadline loop in `_heartbeat_loop` (`PING_INTERVAL_SECONDS` / `PONG_DEADLINE_SECONDS`, the deadline longer than one ping interval so a single lost pong does not close the socket). Every `AUTH_REVALIDATE_INTERVAL_SECONDS` the heartbeat also calls `_revalidate_auth`, which re-reads the session cookie via `get_user_from_cookie`. A revoked / rotated / expired cookie or a `user_id` change (impersonation rotated underneath us) closes the socket with `CLOSE_AUTH_FAILED` (the FE mirrors the code as its own `CLOSE_AUTH_FAILED` constant); the client probes `GET /app/api/me` and either reconnects (still authenticated) or lets the existing `AuthContext` session-check flow take over.
+The ping / pong-deadline loop (`_heartbeat_loop`) uses `PING_INTERVAL_SECONDS` / `PONG_DEADLINE_SECONDS`. Every `AUTH_REVALIDATE_INTERVAL_SECONDS`, `_revalidate_auth` re-reads the cookie via `get_user_from_cookie` and checks admission. Revoked / expired cookies, lost admission, or identity changes close the socket with `CLOSE_AUTH_FAILED`; the client probes `GET /app/api/me` to reconnect or enter the `AuthContext` sign-in flow.
+
+`_reader_loop` checks fresh admission before control messages; sends recheck
+before model launch. Lookup failures close the connection. See
+[Authentication](auth.md#admission-checks).
 
 The client runs its own watchdog independent of the OS TCP layer. `WATCHDOG_DEADLINE_MS` is the deadline; `lastFrameAt` is bumped on every inbound message; the watchdog ticks every `WATCHDOG_TICK_MS` so background-tab `setTimeout` throttling still leaves room before the deadline. On deadline, `forceReconnect()` tears down the (probably half-open) socket and the existing `onclose` handler triggers reconnect. The client also sends its own `{op: "ping"}` every `CLIENT_PING_INTERVAL_MS` so any reverse proxy / NAT idle timeout sees traffic in both directions; the server replies with `{type: "pong"}` and bumps its own `last_pong_at` so client-driven liveness counts.
 

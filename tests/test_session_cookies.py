@@ -59,6 +59,7 @@ def _db(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     monkeypatch.setattr(session_mod, "get_secret_key", lambda: SECRET)
+    monkeypatch.setattr("auth.config.allowed_login_domain", lambda: "example.test")
     # Google sign-in: cookies here carry no password fingerprint.
     monkeypatch.setattr("auth.config.login_method", lambda: "google")
     monkeypatch.setattr("chat.auth.is_admin", lambda email: email == ADMIN_EMAIL)
