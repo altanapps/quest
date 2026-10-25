@@ -372,7 +372,10 @@ class TestMatrix:
         table = world.t["mine"]
         before = _snapshot(world, table)
         got = _dispatch(world, tool, _args(tool, table["id"]), **flags)
-        assert got == {"error": "denied", "message": reason}
+        if flags.get("is_user_subagent"):
+            assert "not available in cross-user subagent runs" in got["error"]
+        else:
+            assert got == {"error": "denied", "message": reason}
         assert _snapshot(world, table) == before
 
     @pytest.mark.parametrize("tool", WRITE_TOOLS)

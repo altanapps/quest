@@ -454,7 +454,7 @@ async def execute_tool_call(
         conversation_id: Optional conversation ID for context injection.
         block_mutating: Refuse the state-changing internal routes
             (``chat.llm.tool_schemas.MUTATING_PROXY_PATHS``). Set for
-            one-shot inference API runs, which must not change anything.
+            inference API and cross-user subagent runs.
 
     Returns:
         Tuple of (result_string, notices) where notices is a list of
@@ -490,8 +490,8 @@ async def execute_tool_call(
             if path.rstrip("/") in MUTATING_PROXY_PATHS:
                 return json.dumps({
                     "error": f"The path '{path}' is not available in "
-                             "inference API runs: it changes external state "
-                             "and inference runs are read-only."
+                             "inference API runs or cross-user subagent runs: "
+                             "it changes external state and these runs are read-only."
                 }), []
 
         # Resolve route

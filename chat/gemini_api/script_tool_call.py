@@ -125,7 +125,7 @@ async def script_tool_call_endpoint(
     conversation id itself is not passed: a script has no conversation of
     its own to attribute reads to (``doc_reads.json`` stays untouched).
 
-    A container launched from an inference API run holds a lease with
+    A container launched from an inference API or cross-user subagent run holds a lease with
     ``block_mutating_tools`` set: the mutating dynamic tools are refused
     here exactly as the run's own tool dispatch refuses them.
     """
@@ -159,7 +159,7 @@ async def script_tool_call_endpoint(
                     "error": (
                         f"Tool '{body.tool_name}' is not available from this "
                         "container: it changes external state and the "
-                        "launching inference API run is read-only."
+                        "launching run is read-only."
                     ),
                 },
             )
