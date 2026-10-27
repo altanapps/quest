@@ -56,6 +56,7 @@ def _run(coro):
 @pytest.fixture(autouse=True)
 def _secret(monkeypatch):
     monkeypatch.setattr(session_mod, "get_secret_key", lambda: SECRET)
+    monkeypatch.setattr("auth.config.allowed_login_domain", lambda: "example.test")
 
 
 def _cookie(payload) -> str:

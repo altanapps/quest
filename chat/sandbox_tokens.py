@@ -195,6 +195,8 @@ async def get_current_sandbox_user(request: Request) -> dict:
                 ),
             },
         )
+    from chat.auth import require_user_allowed
+    require_user_allowed(user)
     # Expose the lease to the route body (the script tool-call bridge reads
     # block_mutating_tools through get_sandbox_lease) and refuse the
     # mutating HTTP routes outright for restricted leases.

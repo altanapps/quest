@@ -183,13 +183,9 @@ def test_send_rejected_when_user_row_missing(monkeypatch):
     assert socket_mod._active_send_runs.get("conv-1") is None
 
 
-def test_send_falls_back_to_cached_user_on_db_error(monkeypatch):
-    """A transient DB error during the fresh read falls back to the cached
-    ``conn.user`` snapshot (matching prior behavior) rather than dropping
-    the user's send.
-    """
-    conn, _ws = _make_conn()
-    stale_user = conn.user
+def test_send_fails_closed_on_db_error(monkeypatch):
+    """A cached identity cannot establish current admission during an outage."""
+    conn, ws = _make_conn()
     captured: dict = {}
     _patch_send_path(monkeypatch, fresh_user=None, captured=captured)
 
@@ -200,4 +196,19 @@ def test_send_falls_back_to_cached_user_on_db_error(monkeypatch):
 
     _run(_drive_send(conn))
 
-    assert captured.get("user") is stale_user
+    assert "user" not in captured
+    assert ws.closed
+    assert conn.shutdown.is_set()
+
+
+def test_send_rechecks_admission_before_launch(monkeypatch):
+    conn, ws = _make_conn()
+    captured = {}
+    _patch_send_path(monkeypatch, fresh_user=conn.user, captured=captured)
+    monkeypatch.setattr(socket_mod, "check_user_allowed", lambda _email: False)
+
+    _run(_drive_send(conn))
+
+    assert "user" not in captured
+    assert ws.closed
+    assert conn.shutdown.is_set()

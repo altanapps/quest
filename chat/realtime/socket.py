@@ -33,7 +33,7 @@ import logging
 import time
 from typing import Any, Optional
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 from auth.config import COOKIE_NAME
 from auth.session import get_user_from_cookie
@@ -246,22 +246,49 @@ async def _authenticate(
 
 
 async def _revalidate_auth(conn: _Connection) -> bool:
-    """Re-check the WS's session cookie. Returns True if still valid."""
+    """Re-check the cookie and current admission policy."""
     signed_cookie = conn.websocket.cookies.get(COOKIE_NAME)
     if not signed_cookie:
         # Cookie may have been deleted (logout); refuse.
         return False
     try:
         user = await get_user_from_cookie(signed_cookie)
+    except HTTPException:
+        return False
     except Exception:
         logger.exception("[realtime] heartbeat auth check raised")
         return False
-    if user is None:
+    if user is None or not check_user_allowed(user.get("email", "")):
         return False
     # Identity change (impersonation rotated underneath us): refuse so the
     # client opens a fresh socket with the new identity.
     if user["id"] != conn.user_id:
         return False
+    conn.user = user
+    return True
+
+
+async def _close_auth_revoked(conn: _Connection) -> None:
+    """End a live connection that no longer passes authentication."""
+    try:
+        await _send_to_client(conn, {
+            "type": "error", "code": CLOSE_AUTH_FAILED, "error": "auth_revoked",
+        })
+        await conn.websocket.close(code=CLOSE_AUTH_FAILED)
+    finally:
+        conn.shutdown.set()
+
+
+async def _admission_is_current(conn: _Connection) -> bool:
+    """Authorize control messages using a fresh user, never a cached email."""
+    try:
+        user = await get_user_by_id(conn.user_id)
+    except Exception:
+        logger.exception("[realtime] admission lookup failed (user_id=%s)", conn.user_id)
+        return False
+    if user is None or not check_user_allowed(user.get("email", "")):
+        return False
+    conn.user = user
     return True
 
 
@@ -276,6 +303,10 @@ async def _reader_loop(conn: _Connection) -> None:
         while True:
             data = await conn.websocket.receive_json()
             op = data.get("op")
+            if op in {"subscribe", "send_message", "stop"}:
+                if not await _admission_is_current(conn):
+                    await _close_auth_revoked(conn)
+                    return
             if op == "subscribe":
                 await _handle_subscribe(conn, data)
             elif op == "unsubscribe":
@@ -816,14 +847,13 @@ async def _handle_send_message(conn: _Connection, data: dict) -> None:
     try:
         fresh_user = await get_user_by_id(conn.user_id)
     except Exception:
-        # Transient DB error: fall back to the cached snapshot with a
-        # logged warning. This matches today's behavior (using conn.user)
-        # rather than dropping the user's send.
+        # A stale snapshot cannot establish that the user is still admitted.
         logger.warning(
-            "[realtime] fresh user re-load failed; falling back to cached "
-            "snapshot (user_id=%s)", conn.user_id, exc_info=True,
+            "[realtime] fresh user re-load failed (user_id=%s)",
+            conn.user_id, exc_info=True,
         )
-        fresh_user = conn.user
+        await _close_auth_revoked(conn)
+        return
     else:
         if fresh_user is None:
             # User row is gone (deleted). Reject the send rather than
@@ -837,6 +867,10 @@ async def _handle_send_message(conn: _Connection, data: dict) -> None:
         # Keep the connection snapshot from rotting so any future consumer
         # of conn.user benefits from the fresh read too.
         conn.user = fresh_user
+
+    if not check_user_allowed(fresh_user.get("email", "")):
+        await _close_auth_revoked(conn)
+        return
 
     task = asyncio.create_task(
         _run_send_message(
@@ -1246,16 +1280,7 @@ async def _heartbeat_loop(conn: _Connection) -> None:
                         "[realtime] auth revalidation failed "
                         "(user_id=%s); closing socket", conn.user_id,
                     )
-                    await _send_to_client(conn, {
-                        "type": "error",
-                        "code": CLOSE_AUTH_FAILED,
-                        "error": "auth_revoked",
-                    })
-                    try:
-                        await conn.websocket.close(code=CLOSE_AUTH_FAILED)
-                    except Exception:
-                        pass
-                    conn.shutdown.set()
+                    await _close_auth_revoked(conn)
                     return
     except Exception:
         logger.exception("[realtime] heartbeat loop crashed")

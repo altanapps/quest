@@ -87,7 +87,9 @@ Every session cookie is issued by `set_session_cookie()` or `set_impersonation_c
 - **Revocation by session epoch.** `users.session_epoch` is the account's session generation. A cookie whose `e` differs from the stored value is rejected; the check runs on the user row `get_user_from_cookie()` loads anyway, so it costs no extra query. `bump_session_epoch()` in `db/user_store.py` advances it, which ends every session of the account on every device: on `POST /app/api/logout` and `GET /auth/logout` (`revoke_cookie_session()`), on `POST /app/api/logout-and-disconnect` (`revoke_sessions()`), and inside `set_password_hash()`.
 - **Sign-out targets the session's owner** (`session_owner_id()`): signing out of an impersonation ends the admin's sessions, never the impersonated user's.
 
-The persistent WebSocket re-validates its cookie on a heartbeat (`_revalidate_auth()` in `chat/realtime/socket.py`), so an expired or revoked session also loses its open socket.
+The persistent WebSocket re-validates its cookie and admission on a heartbeat
+(`_revalidate_auth()` in `chat/realtime/socket.py`); control messages also check
+current admission before dispatch. See [Realtime](realtime.md#heartbeat-and-auth).
 
 ## Dev Login
 
@@ -103,7 +105,15 @@ The domain is resolved by `allowed_login_domain()`:
 - then the `allowed_login_domain` key in `server_config.json` in all modes (written by the prod bootstrap wizard so a deployment for another organization can admit its own domain);
 - then the hardcoded `ALLOWED_DOMAIN`.
 
-Outside local mode the same rule runs on every API request: `require_user_allowed()` in `chat/auth.py` raises 403 `access_denied` and is called from every request-authenticating dependency (`get_current_user` and `get_current_user_cookie_or_apikey` in `auth/session.py`, and `get_current_user_cookie_or_apikey` plus its identical `_checked` alias in `chat/auth.py`). So the script tool-call bridge, the `/api/authed-get|post` proxy, the Gmail Simple routes and the `/api/instructions` + `/api/reset-api-key` root endpoints reject an offboarded user's still-valid cookie or `users.api_key` exactly like the `/app/api/*` routes. A session cookie stays valid for up to its lifetime unless the account signs out (see Session Cookies), and an API key never expires, so this per-request check is what cuts off an offboarded user immediately.
+Outside local mode, `require_user_allowed()` in `chat/auth.py` raises 403
+`access_denied` for an excluded user. Cookie resolution itself
+(`get_user_from_cookie()` in `auth/session.py`) applies this rule, so manually
+authenticated connector routes and OAuth callbacks enforce it as well as the
+standard HTTP dependencies. `get_current_sandbox_user()` in
+`chat/sandbox_tokens.py` applies it on every lease-authenticated request.
+Still-valid credentials do not preserve admission after an allowlist/domain
+change. Only sign-out and restoration of an admitted impersonator bypass the
+target's admission check; they cannot grant access to that target's data.
 
 UI messages describe the restriction via `login_restriction_description()` ("@domain accounts", or "approved accounts" when a whitelist is configured); the whitelist itself is never enumerated on unauthenticated surfaces such as the sign-in page or the `login_restriction` field of `GET /app/api/config`.
 

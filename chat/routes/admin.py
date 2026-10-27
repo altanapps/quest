@@ -2249,7 +2249,8 @@ async def admin_stop_impersonation(
             }
         )
 
-    user = await get_user_from_cookie(signed_cookie)
+    # Leaving impersonation must work even if the target loses admission.
+    user = await get_user_from_cookie(signed_cookie, require_admission=False)
     if not user:
         raise HTTPException(
             status_code=401,
@@ -2288,6 +2289,8 @@ async def admin_stop_impersonation(
                 "message": "Invalid session.",
             }
         )
+    from chat.auth import require_user_allowed
+    require_user_allowed(admin_user)
     password_fp = admin_user.get("password_fp") if is_password_login() else None
     return set_session_cookie(JSONResponse({"success": True}), admin_user, password_fp)
 
